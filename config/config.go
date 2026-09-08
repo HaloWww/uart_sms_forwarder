@@ -15,8 +15,12 @@ type JWTConfig struct {
 
 // SerialConfig 串口配置
 type SerialConfig struct {
-	Port    string               `json:"Port"`    // 旧版单设备串口路径，为空则自动检测
-	Devices []SerialDeviceConfig `json:"Devices"` // 多设备配置；为空时自动创建 default 设备
+	// 默认不需要列出设备：当 Port 和 Devices 都为空时，系统会自动发现所有
+	// 运行本项目 Lua 脚本的 Air780。Ports 只用于限制自动探测范围，不是设备身份。
+	AutoDiscover *bool                `json:"AutoDiscover"`
+	Ports        []string             `json:"Ports"`
+	Port         string               `json:"Port"`    // 兼容旧版单设备配置
+	Devices      []SerialDeviceConfig `json:"Devices"` // 兼容旧版静态多设备配置
 }
 
 // SerialDeviceConfig 描述一条 Air780 物理连接。ID 只标识连接配置；

@@ -94,6 +94,7 @@ func TestKnownSIMRemainsListedWhenOffline(t *testing.T) {
 	status.Mobile.Iccid = "8986000000000000001"
 	status.Mobile.Imsi = "460001234567890"
 	status.Mobile.Imei = "860000000000000"
+	status.Mobile.Number = "13800138000"
 	status.IdentityValid = true
 	status.Version = minimumSIMIdentityProtocolVersion
 	manager.observeStatus(status)
@@ -102,15 +103,26 @@ func TestKnownSIMRemainsListedWhenOffline(t *testing.T) {
 		t.Fatal(err)
 	}
 	if profile.ICCID != status.Mobile.Iccid || profile.LastDeviceID != status.DeviceID ||
-		profile.LastPort != status.PortName || profile.LastSeenAt == 0 {
+		profile.LastPort != status.PortName || profile.LastSeenAt == 0 ||
+		profile.Number != status.Mobile.Number {
 		t.Fatalf("observed SIM profile was not fully updated: %+v", profile)
+	}
+	persistedNumber := profile.Number
+	status.Mobile.Number = ""
+	manager.observeStatus(status)
+	if err := db.First(&profile, "id = ?", status.SIMID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if profile.Number != persistedNumber {
+		t.Fatalf("empty MSISDN erased persisted number: %+v", profile)
 	}
 
 	sims, err := manager.GetSIMs(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(sims) != 1 || sims[0].SIMID != status.SIMID || sims[0].Online {
+	if len(sims) != 1 || sims[0].SIMID != status.SIMID || sims[0].Online ||
+		sims[0].Number != persistedNumber {
 		t.Fatalf("offline persisted SIMs = %+v", sims)
 	}
 	if err := manager.ValidateSIM(context.Background(), status.SIMID); err != nil {

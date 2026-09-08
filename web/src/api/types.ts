@@ -97,6 +97,7 @@ export interface SimStatus {
     name: string;
     iccid: string;
     imsi: string;
+    number: string;
     online: boolean;
     sendReady: boolean;
     scriptCompatible: boolean;

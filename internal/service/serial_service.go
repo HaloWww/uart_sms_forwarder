@@ -3,7 +3,6 @@ package service
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +29,12 @@ const (
 	CacheTTL = 5 * time.Minute
 	// 物理控制命令必须收到同一 request_id 的设备确认后才提交主机状态。
 	controlCommandResponseTimeout = 5 * time.Second
+	// serial.Open 没有 context API；隔离后最多等待这一时长，端点回收也可
+	// 通过父 context 立即终止当前 worker。
+	serialConnectWindow = 5 * time.Second
+	// 16 KiB 在 115200 baud 下正常写出远小于此值；超时意味着驱动或
+	// 设备异常，必须摘除句柄并重连，不能永久占住全局路由租约。
+	defaultSerialWriteWindow = 5 * time.Second
 	// 与 main.lua 的 max_uart_recv_buffer_size 保持一致。
 	MaxUARTCommandFrameBytes = 16 * 1024
 )
@@ -60,9 +65,13 @@ type SerialService struct {
 	notifier                   *Notifier
 	propertyService            *PropertyService
 	handlers                   map[string]messageHandler
+	callbacksMu                sync.RWMutex
 	statusObserver             func(*StatusData)
 	simRouteValidator          func(deviceID string, identity SIMIdentity) error
+	routeWriteGuard            func(operation func() error) error
 	scheduledTaskStatusUpdater ScheduledTaskStatusUpdater
+	requireDiscoveryHandshake  bool
+	skipNextDiscoveryHandshake bool
 	wg                         sync.WaitGroup
 	// 设备信息缓存
 	deviceCache cache.Cache[string, *StatusData]
@@ -70,8 +79,11 @@ type SerialService struct {
 	mu        sync.RWMutex
 	portName  string // 当前使用的串口名称
 	connected bool   // 连接状态
-	writeMu   sync.Mutex
+	portMu    sync.RWMutex
+	writeMu   sync.Mutex // 只串行化写操作；关闭端口绝不能等待这把锁
+	portEpoch uint64
 	smsSendMu sync.Mutex
+	writeWait time.Duration
 	// 每次串口重连、模块重启或 SIM 变化都会推进状态代际。业务路由只接受
 	// 当前代际的新状态，防止上一台模块/上一张卡的缓存被新连接复用。
 	statusEpoch     atomic.Uint64
@@ -117,6 +129,7 @@ func NewSerialService(
 		notifier:        notifier,
 		propertyService: propertyService,
 		deviceCache:     cache.New[string, *StatusData](CacheTTL),
+		writeWait:       defaultSerialWriteWindow,
 	}
 	service.lastSMSActivityAt.Store(time.Now().UnixMilli())
 	service.statusAccepting.Store(true)
@@ -128,21 +141,63 @@ func (s *SerialService) DeviceID() string   { return s.deviceID }
 func (s *SerialService) DeviceName() string { return s.deviceName }
 
 func (s *SerialService) SetStatusObserver(observer func(*StatusData)) {
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
 	s.statusObserver = observer
 }
 
 func (s *SerialService) SetSIMRouteValidator(
 	validator func(deviceID string, identity SIMIdentity) error,
 ) {
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
 	s.simRouteValidator = validator
 }
 
+func (s *SerialService) SetRouteWriteGuard(guard func(operation func() error) error) {
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
+	s.routeWriteGuard = guard
+}
+
 func (s *SerialService) SetScheduledTaskStatusUpdater(updater ScheduledTaskStatusUpdater) {
+	s.callbacksMu.Lock()
+	defer s.callbacksMu.Unlock()
 	s.scheduledTaskStatusUpdater = updater
 }
 
-// Start 启动串口服务（使用 backoff 重连机制）
-func (s *SerialService) Start() {
+func (s *SerialService) getStatusObserver() func(*StatusData) {
+	s.callbacksMu.RLock()
+	defer s.callbacksMu.RUnlock()
+	return s.statusObserver
+}
+
+func (s *SerialService) getSIMRouteCallbacks() (
+	func(deviceID string, identity SIMIdentity) error,
+	func(operation func() error) error,
+) {
+	s.callbacksMu.RLock()
+	defer s.callbacksMu.RUnlock()
+	return s.simRouteValidator, s.routeWriteGuard
+}
+
+func (s *SerialService) getScheduledTaskStatusUpdater() ScheduledTaskStatusUpdater {
+	s.callbacksMu.RLock()
+	defer s.callbacksMu.RUnlock()
+	return s.scheduledTaskStatusUpdater
+}
+
+func (s *SerialService) withRouteWriteGuard(operation func() error) error {
+	_, guard := s.getSIMRouteCallbacks()
+	if guard != nil {
+		return guard(operation)
+	}
+	return operation()
+}
+
+// Start 启动串口服务（使用 backoff 重连机制）。ctx 取消时会关闭当前
+// 串口并终止重连，供自动发现协调器安全回收已拔出的端点。
+func (s *SerialService) Start(ctx context.Context) {
 
 	// 启动主循环
 	b := &backoff.Backoff{
@@ -153,7 +208,13 @@ func (s *SerialService) Start() {
 	}
 
 	for {
-		err := s.runOnce(b.Reset)
+		if ctx.Err() != nil {
+			return
+		}
+		err := s.runOnce(ctx, b.Reset)
+		if ctx.Err() != nil {
+			return
+		}
 
 		// 连接失败或断开，使用 backoff 重试
 		if err != nil {
@@ -164,7 +225,15 @@ func (s *SerialService) Start() {
 			s.logger.Warn("串口连接异常，将重试",
 				zap.Error(err),
 				zap.Duration("retry_after", retryAfter))
-			time.Sleep(retryAfter)
+			timer := time.NewTimer(retryAfter)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			case <-timer.C:
+			}
 		}
 	}
 }
@@ -224,7 +293,7 @@ func (s *SerialService) resetPhysicalConnectionState() {
 }
 
 // runOnce 执行一次连接尝试
-func (s *SerialService) runOnce(resetBackoff func()) error {
+func (s *SerialService) runOnce(ctx context.Context, resetBackoff func()) error {
 	// 获取串口列表
 	ports, err := serial.GetPortsList()
 	if err != nil {
@@ -246,15 +315,27 @@ func (s *SerialService) runOnce(resetBackoff func()) error {
 	} else {
 		// 自动检测
 		s.logger.Info("开始自动检测串口...")
-		selectedPort, err = s.autoDetectPort(ports)
+		selectedPort, err = s.autoDetectPort(ctx, ports)
 		if err != nil {
 			return fmt.Errorf("自动检测串口失败: %w", err)
 		}
 		s.logger.Info("自动检测到可用串口", zap.String("port", selectedPort))
 	}
 
+	// 自动发现的端点每次重连都重新验证项目握手，避免同一串口号后来
+	// 被其他硬件占用时把命令发送给错误设备。静态旧配置保持兼容。
+	if s.requireDiscoveryHandshake {
+		if s.skipNextDiscoveryHandshake {
+			s.skipNextDiscoveryHandshake = false
+		} else {
+			if _, err := probeAir780Port(ctx, selectedPort); err != nil {
+				return fmt.Errorf("Air780 重连握手失败: %w", err)
+			}
+		}
+	}
+
 	// 连接串口
-	if err := s.connectSerial(selectedPort); err != nil {
+	if err := s.connectSerial(ctx, selectedPort); err != nil {
 		return fmt.Errorf("连接串口失败: %w", err)
 	}
 
@@ -272,8 +353,17 @@ func (s *SerialService) runOnce(resetBackoff func()) error {
 	s.logger.Info("串口连接成功", zap.String("port", selectedPort))
 
 	// 为本次连接创建独立的 context，用于管理连接的生命周期
-	connCtx, connCancel := context.WithCancel(context.Background())
+	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel() // 确保退出时取消 context
+	closeOnCancelDone := make(chan struct{})
+	go func() {
+		select {
+		case <-connCtx.Done():
+			s.closeSerial()
+		case <-closeOnCancelDone:
+		}
+	}()
+	defer close(closeOnCancelDone)
 
 	// 启动监听 goroutine
 	s.wg.Add(1)
@@ -298,11 +388,14 @@ func (s *SerialService) runOnce(resetBackoff func()) error {
 	s.resetPhysicalConnectionState()
 	s.invalidateDeviceStatus(false)
 
-	return nil
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("串口连接已断开")
 }
 
 // connectSerial 连接串口
-func (s *SerialService) connectSerial(portName string) error {
+func (s *SerialService) connectSerial(ctx context.Context, portName string) error {
 	mode := &serial.Mode{
 		BaudRate: 115200,
 		DataBits: 8,
@@ -310,63 +403,26 @@ func (s *SerialService) connectSerial(portName string) error {
 		Parity:   serial.NoParity,
 	}
 
-	port, err := serial.Open(portName, mode)
+	connectCtx, cancel := context.WithTimeout(ctx, serialConnectWindow)
+	defer cancel()
+	port, err := openSerialPortWithContext(connectCtx, portName, mode)
 	if err != nil {
 		return err
 	}
 
-	s.writeMu.Lock()
-	s.port = port
-	s.writeMu.Unlock()
+	s.installSerialPort(port)
 	return nil
 }
 
 // autoDetectPort 自动检测可用串口
-func (s *SerialService) autoDetectPort(ports []string) (string, error) {
+func (s *SerialService) autoDetectPort(ctx context.Context, ports []string) (string, error) {
 	for _, portName := range ports {
 		s.logger.Debug("测试串口", zap.String("port", portName))
-
-		mode := &serial.Mode{
-			BaudRate: 115200,
-			DataBits: 8,
-			StopBits: serial.OneStopBit,
-			Parity:   serial.NoParity,
-		}
-
-		port, err := serial.Open(portName, mode)
-		if err != nil {
-			s.logger.Debug("打开串口失败", zap.String("port", portName), zap.Error(err))
-			continue
-		}
-
-		// 设置读取超时
-		port.SetReadTimeout(1 * time.Second)
-
-		// 发送测试命令（使用正确的协议格式）
-		testCmd := map[string]string{"action": "get_status"}
-		jsonData, _ := json.Marshal(testCmd)
-		// 添加协议包围标志
-		message := fmt.Sprintf("CMD_START:%s:CMD_END\r\n", string(jsonData))
-
-		err = writeAll(port, []byte(message))
-		if err != nil {
-			port.Close()
-			continue
-		}
-
-		// 等待响应
-		time.Sleep(500 * time.Millisecond)
-
-		buffer := make([]byte, 4096)
-		n, err := port.Read(buffer)
-		port.Close()
-
-		if err == nil && n > 0 {
-			response := string(buffer[:n])
-			if isValidResponse(response) {
-				s.logger.Debug("检测到可用串口", zap.String("port", portName))
-				return portName, nil
-			}
+		if _, err := probeAir780Port(ctx, portName); err == nil {
+			s.logger.Debug("检测到可用串口", zap.String("port", portName))
+			return portName, nil
+		} else {
+			s.logger.Debug("串口未通过 Air780 握手", zap.String("port", portName), zap.Error(err))
 		}
 	}
 
@@ -385,9 +441,7 @@ func (s *SerialService) listenSerialData(connCtx context.Context, connCancel con
 		connCancel()
 	}()
 
-	s.writeMu.Lock()
-	port := s.port
-	s.writeMu.Unlock()
+	port, _ := s.serialPortSnapshot()
 	if port == nil {
 		return
 	}
@@ -495,8 +549,9 @@ func (s *SerialService) SendSMS(expected SIMIdentity, to, content, requestID str
 		}
 		return "", err
 	}
-	if s.simRouteValidator != nil {
-		if err := s.simRouteValidator(s.deviceID, expected); err != nil {
+	routeValidator, routeWriteGuard := s.getSIMRouteCallbacks()
+	if routeValidator != nil {
+		if err := routeValidator(s.deviceID, expected); err != nil {
 			if restoreManualFlymode {
 				s.restoreManualFlymode(s.newManualFlymodeRestoreToken(expected, manualFlymodeGen))
 			}
@@ -552,9 +607,26 @@ func (s *SerialService) SendSMS(expected SIMIdentity, to, content, requestID str
 		"expected_iccid": expected.ICCID,
 	}
 
-	// 必须先登记超时，再写串口，避免设备极快返回结果造成竞态。
-	s.startSMSSendTimeout(msgID)
-	if err := s.sendJSONCommand(cmd); err != nil {
+	// 最终身份校验和 UART 写入共用 manager 的路由读租约；自动发现要修改
+	// 拓扑时取得写租约，因此不能插入二者之间。超时仍必须先于写入登记，
+	// 避免设备极快返回结果造成回执竞态。
+	validateAndWrite := func() error {
+		if routeValidator != nil {
+			if err := routeValidator(s.deviceID, expected); err != nil {
+				return err
+			}
+		}
+		s.startSMSSendTimeout(msgID)
+		return s.sendJSONCommand(cmd)
+	}
+	var writeErr error
+	if routeWriteGuard != nil {
+		writeErr = routeWriteGuard(validateAndWrite)
+	} else {
+		writeErr = validateAndWrite()
+	}
+	if writeErr != nil {
+		err := writeErr
 		if writeMayHaveReachedDevice(err) {
 			// 串口驱动可能在已经写出部分甚至全部字节后同时返回错误。此时
 			// 设备有机会完成发送，必须保留超时和计划任务登记，禁止按普通失败重试。
@@ -746,6 +818,17 @@ func (s *SerialService) setFlymode(
 	reason string,
 	expected *SIMIdentity,
 ) error {
+	return s.withRouteWriteGuard(func() error {
+		return s.setFlymodeWithRoute(enabled, source, reason, expected)
+	})
+}
+
+func (s *SerialService) setFlymodeWithRoute(
+	enabled bool,
+	source flymodeChangeSource,
+	reason string,
+	expected *SIMIdentity,
+) error {
 	if enabled {
 		if expected == nil || expected.SIMID == "" || expected.ICCID == "" {
 			return ErrSIMIdentityRequired
@@ -762,6 +845,12 @@ func (s *SerialService) setFlymode(
 		// 飞行模式中 ICCID 暂不可读；相同 owner 只是在 automatic/manual
 		// 之间转移策略所有权，由 Lua 对已保存 owner 再核对，不重复切换基带。
 		if !sameOwnerFlight {
+			routeValidator, _ := s.getSIMRouteCallbacks()
+			if routeValidator != nil {
+				if err := routeValidator(s.deviceID, *expected); err != nil {
+					return err
+				}
+			}
 			if err := s.ensureSIMIdentity(*expected); err != nil {
 				return err
 			}
@@ -814,11 +903,23 @@ func (s *SerialService) setFlymode(
 func (s *SerialService) RebootMcu(expected *SIMIdentity) error {
 	s.smsSendMu.Lock()
 	defer s.smsSendMu.Unlock()
+	return s.withRouteWriteGuard(func() error {
+		return s.rebootMcuWithRoute(expected)
+	})
+}
+
+func (s *SerialService) rebootMcuWithRoute(expected *SIMIdentity) error {
 	if s.hasPendingSMS() {
 		return ErrSMSOperationPending
 	}
 	cmd := map[string]any{"action": "reboot_mcu"}
 	if expected != nil {
+		routeValidator, _ := s.getSIMRouteCallbacks()
+		if routeValidator != nil {
+			if err := routeValidator(s.deviceID, *expected); err != nil {
+				return err
+			}
+		}
 		if err := s.ensureSIMIdentity(*expected); err != nil {
 			return err
 		}
@@ -879,13 +980,6 @@ func (s *SerialService) sendControlCommand(cmd map[string]any) error {
 
 // sendJSONCommand 发送JSON命令到设备
 func (s *SerialService) sendJSONCommand(cmd any) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if s.port == nil {
-		return fmt.Errorf("串口未连接")
-	}
-
 	message, jsonData, err := buildCommandMessage(cmd)
 	if err != nil {
 		return err
@@ -894,26 +988,88 @@ func (s *SerialService) sendJSONCommand(cmd any) error {
 		return fmt.Errorf("串口命令帧过大: %d > %d", len(message), MaxUARTCommandFrameBytes)
 	}
 
-	err = writeAll(s.port, message)
-	if err != nil {
-		return fmt.Errorf("串口写入失败: %w", err)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	port, epoch := s.serialPortSnapshot()
+	if port == nil {
+		return fmt.Errorf("串口未连接")
+	}
+
+	resultCh := make(chan error, 1)
+	go func() { resultCh <- writeAll(port, message) }()
+	timer := time.NewTimer(s.writeWait)
+	defer timer.Stop()
+	select {
+	case err = <-resultCh:
+		if err != nil {
+			s.closeSerialEpoch(epoch)
+			return fmt.Errorf("串口写入失败: %w", err)
+		}
+	case <-timer.C:
+		// Write 已交给驱动，超时无法证明设备没有收到数据，因此沿用
+		// writeProgressError 的“不确定提交”语义。
+		s.closeSerialEpoch(epoch)
+		err = wrapWriteProgressError(0, context.DeadlineExceeded)
+		return fmt.Errorf("串口写入超时: %w", err)
 	}
 	s.logger.Debug("串口命令已发送", zap.Int("payload_bytes", len(jsonData)))
 
 	return nil
 }
 
-// closeSerial 与写操作使用同一把锁，避免断连时关闭/置空端口和写入并发。
+func (s *SerialService) installSerialPort(port serial.Port) {
+	s.portMu.Lock()
+	previous := s.port
+	s.port = port
+	s.portEpoch++
+	s.portMu.Unlock()
+	if previous != nil {
+		s.closeDetachedSerialPort(previous)
+	}
+}
+
+func (s *SerialService) serialPortSnapshot() (serial.Port, uint64) {
+	s.portMu.RLock()
+	defer s.portMu.RUnlock()
+	return s.port, s.portEpoch
+}
+
+// closeSerial 先原子摘除句柄，再异步 Close。它不等待 writeMu，因此即使
+// 驱动的 Write 卡住，取消连接仍能发起 Close 并让路由/发现流程继续。
 func (s *SerialService) closeSerial() {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if s.port == nil {
+	s.portMu.Lock()
+	port := s.port
+	if port == nil {
+		s.portMu.Unlock()
 		return
 	}
-	if err := s.port.Close(); err != nil {
-		s.logger.Debug("关闭串口失败", zap.Error(err))
-	}
 	s.port = nil
+	s.portEpoch++
+	s.portMu.Unlock()
+	s.setConnected(false)
+	s.closeDetachedSerialPort(port)
+}
+
+func (s *SerialService) closeSerialEpoch(epoch uint64) {
+	s.portMu.Lock()
+	if s.port == nil || s.portEpoch != epoch {
+		s.portMu.Unlock()
+		return
+	}
+	port := s.port
+	s.port = nil
+	s.portEpoch++
+	s.portMu.Unlock()
+	s.setConnected(false)
+	s.closeDetachedSerialPort(port)
+}
+
+func (s *SerialService) closeDetachedSerialPort(port serial.Port) {
+	go func() {
+		if err := port.Close(); err != nil {
+			s.logger.Debug("关闭串口失败", zap.Error(err))
+		}
+	}()
 }
 
 func writeAll(writer io.Writer, data []byte) error {

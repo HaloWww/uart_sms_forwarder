@@ -6,6 +6,7 @@ type SIMProfile struct {
 	Name           string `json:"name"`
 	ICCID          string `gorm:"column:iccid;uniqueIndex" json:"iccid"`
 	IMSI           string `gorm:"index" json:"imsi"`
+	Number         string `json:"number"`
 	LastIMEI       string `gorm:"index" json:"lastImei"`
 	LastDeviceID   string `json:"lastDeviceId"`
 	LastDeviceName string `json:"lastDeviceName"`

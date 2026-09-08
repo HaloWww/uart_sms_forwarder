@@ -30,15 +30,10 @@ App:
 
   # 串口配置
   Serial:
-    # 多设备模式。ID 只标识物理串口连接；短信和计划任务按自动读取的 ICCID 归属。
-    Devices:
-      - ID: "air780-1"
-        Name: "Air780 一号"
-        Port: "/dev/ttyUSB0"
-        Enabled: true
-      # - ID: "air780-2"
-      #   Name: "Air780 二号"
-      #   Port: "/dev/ttyUSB1"
-      #   Enabled: true
-    # 兼容旧版：Devices 为空时使用 Port 创建 default 设备，留空则自动检测。
-    Port: ""
+    # 自动发现并管理所有烧录了本项目 main.lua 1.4.0+ 的 Air780。
+    # 省略整个 Serial 配置时也默认启用自动发现。
+    AutoDiscover: true
+    # 可选：有其他 USB 串口设备时，只允许探测下列端口；这不是 SIM 身份配置。
+    # Ports:
+    #   - "/dev/ttyUSB0"
+    #   - "/dev/ttyUSB1"

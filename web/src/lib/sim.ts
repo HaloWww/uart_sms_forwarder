@@ -6,10 +6,10 @@ export function simIdentityTail(simId: string, iccid = '') {
 }
 
 export function formatSimLabel(sim?: SimStatus, fallbackSimId = '') {
-    if (sim?.name?.trim()) return sim.name.trim();
-    const number = sim?.currentStatus?.mobile?.number?.trim();
-    if (number) return number;
     const tail = simIdentityTail(sim?.simId || fallbackSimId, sim?.iccid);
+    const number = sim?.currentStatus?.mobile?.number?.trim() || sim?.number?.trim();
+    if (number) return tail ? `${number} · SIM •${tail}` : number;
+    if (sim?.name?.trim()) return sim.name.trim();
     return tail ? `SIM •${tail}` : '未知 SIM';
 }
 

@@ -2,12 +2,16 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dushixiang/uart_sms_forwarder/config"
+	"go.bug.st/serial"
 	"go.uber.org/zap"
 )
 
@@ -78,6 +82,67 @@ func TestGetStatusRejectsPreviousConnectionGeneration(t *testing.T) {
 	}
 }
 
+func TestSerialWriteTimeoutDetachesAndClosesBlockedPort(t *testing.T) {
+	service := NewSerialService(zap.NewNop(), config.SerialConfig{}, "default", "Air780", nil, nil, nil)
+	service.writeWait = 25 * time.Millisecond
+	port := newBlockingWriteSerialPort()
+	service.installSerialPort(port)
+	service.setConnected(true)
+
+	started := time.Now()
+	err := service.sendJSONCommand(map[string]string{"action": "get_status"})
+	if !errors.Is(err, context.DeadlineExceeded) || !writeMayHaveReachedDevice(err) {
+		t.Fatalf("blocked write error = %v, want uncertain deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("blocked write took too long: %v", elapsed)
+	}
+	if current, _ := service.serialPortSnapshot(); current != nil {
+		t.Fatal("timed-out serial port remained attached")
+	}
+	if _, connected := service.getConnectionInfo(); connected {
+		t.Fatal("timed-out serial port remained marked connected")
+	}
+	select {
+	case <-port.closed:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out serial port was not closed")
+	}
+}
+
+func TestCloseSerialDoesNotWaitForBlockedWrite(t *testing.T) {
+	service := NewSerialService(zap.NewNop(), config.SerialConfig{}, "default", "Air780", nil, nil, nil)
+	service.writeWait = time.Second
+	port := newBlockingWriteSerialPort()
+	service.installSerialPort(port)
+	done := make(chan error, 1)
+	go func() { done <- service.sendJSONCommand(map[string]string{"action": "get_status"}) }()
+	select {
+	case <-port.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("serial write did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		service.closeSerial()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("closeSerial waited for writeMu")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("interrupted write unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closing the serial port did not release blocked Write")
+	}
+}
+
 type shortWriter struct {
 	bytes.Buffer
 	limit int
@@ -85,6 +150,48 @@ type shortWriter struct {
 
 type failingWriter struct {
 	written int
+}
+
+type blockingWriteSerialPort struct {
+	writeStarted chan struct{}
+	closed       chan struct{}
+	writeOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newBlockingWriteSerialPort() *blockingWriteSerialPort {
+	return &blockingWriteSerialPort{
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (p *blockingWriteSerialPort) Write([]byte) (int, error) {
+	p.writeOnce.Do(func() { close(p.writeStarted) })
+	<-p.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (p *blockingWriteSerialPort) Read([]byte) (int, error) {
+	<-p.closed
+	return 0, io.EOF
+}
+
+func (p *blockingWriteSerialPort) Close() error {
+	p.closeOnce.Do(func() { close(p.closed) })
+	return nil
+}
+
+func (*blockingWriteSerialPort) SetMode(*serial.Mode) error         { return nil }
+func (*blockingWriteSerialPort) Drain() error                       { return nil }
+func (*blockingWriteSerialPort) ResetInputBuffer() error            { return nil }
+func (*blockingWriteSerialPort) ResetOutputBuffer() error           { return nil }
+func (*blockingWriteSerialPort) SetDTR(bool) error                  { return nil }
+func (*blockingWriteSerialPort) SetRTS(bool) error                  { return nil }
+func (*blockingWriteSerialPort) SetReadTimeout(time.Duration) error { return nil }
+func (*blockingWriteSerialPort) Break(time.Duration) error          { return nil }
+func (*blockingWriteSerialPort) GetModemStatusBits() (*serial.ModemStatusBits, error) {
+	return &serial.ModemStatusBits{}, nil
 }
 
 func (w *failingWriter) Write(data []byte) (int, error) {

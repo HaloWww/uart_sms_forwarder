@@ -1,14 +1,14 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.3.0
+-- VERSION: 1.4.0
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 log.info("main", PROJECT, VERSION)
 
@@ -520,6 +520,18 @@ function process_uart_command(cmd_data)
             table.insert(send_queue, item)
             sys.publish("SMS_SEND_QUEUE_CHANGED")
         end
+
+    elseif cmd_data.action == "probe" and type(cmd_data.request_id) == "string" then
+        -- 主机只接受 request_id 与本次随机挑战一致的完整响应，避免把串口中
+        -- 残留的日志、其他 JSON 设备或另一次探测误认成本项目设备。
+        local response = {
+            type = "probe_response",
+            project = PROJECT,
+            version = VERSION,
+            request_id = cmd_data.request_id
+        }
+        attach_identity(response, active_identity)
+        send_to_uart(response, true)
 
     elseif cmd_data.action == "get_status" then
         if not flymode_requested then

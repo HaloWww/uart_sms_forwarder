@@ -122,8 +122,9 @@ func (s *SerialService) handleStatusResponse(msg *ParsedMessage) {
 	statusData.statusEpoch = statusEpoch
 	s.deviceCache.Set(CacheKeyDeviceStatus, &statusData, CacheTTL)
 	s.statusMu.Unlock()
-	if s.statusObserver != nil && s.statusAccepting.Load() && statusEpoch == s.statusEpoch.Load() {
-		s.statusObserver(&statusData)
+	observer := s.getStatusObserver()
+	if observer != nil && s.statusAccepting.Load() && statusEpoch == s.statusEpoch.Load() {
+		observer(&statusData)
 	}
 	s.recoverManualFlymodeIntent(&statusData)
 	s.logger.Debug("设备状态缓存已更新")

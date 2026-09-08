@@ -78,8 +78,9 @@ func (s *SerialService) handleIncomingSMS(msg *ParsedMessage) {
 	identity.SIMID = makeSIMID(identity.ICCID)
 	routeError := strings.TrimSpace(sms.IdentityError)
 	identityConflict := false
-	if identity.Verified && identity.SIMID != "" && s.simRouteValidator != nil {
-		if err := s.simRouteValidator(s.deviceID, identity); err != nil {
+	routeValidator, _ := s.getSIMRouteCallbacks()
+	if identity.Verified && identity.SIMID != "" && routeValidator != nil {
+		if err := routeValidator(s.deviceID, identity); err != nil {
 			// 入站快照是在 SMS_INC 发生时冻结的历史事实。之后换卡或重连
 			// 不能用“当前拓扑”抹掉其归属；只有当前明确存在重复 ICCID
 			// 声明时增加冲突审计标记，仍按冻结 ICCID 归档。
@@ -376,10 +377,11 @@ func (s *SerialService) handleSMSSendResult(msg *ParsedMessage) {
 }
 
 func (s *SerialService) updateScheduledTaskStatus(ctx context.Context, msgID string, status models.LastRunStatus) {
-	if s.scheduledTaskStatusUpdater == nil {
+	updater := s.getScheduledTaskStatusUpdater()
+	if updater == nil {
 		return
 	}
-	if err := s.scheduledTaskStatusUpdater(ctx, msgID, status); err != nil {
+	if err := updater(ctx, msgID, status); err != nil {
 		s.logger.Error("更新定时任务状态失败",
 			zap.String("request_id", msgID),
 			zap.Error(err))
@@ -417,7 +419,7 @@ type scheduledTaskStatusRetry struct {
 // 短信终态已经持久化，所以每次都重新读取数据库；旧消息即使迟到，
 // ScheduledTaskRepo 的 last_msg_id CAS 也不会覆盖任务的新一轮执行。
 func (s *SerialService) scheduleScheduledTaskStatusRetry(msgID string) {
-	if s.scheduledTaskStatusUpdater == nil || s.textMsgService == nil || msgID == "" {
+	if s.getScheduledTaskStatusUpdater() == nil || s.textMsgService == nil || msgID == "" {
 		return
 	}
 	retry := &scheduledTaskStatusRetry{stop: make(chan struct{})}
@@ -479,7 +481,8 @@ func (s *SerialService) reconcileScheduledTaskStatus(ctx context.Context, msgID 
 }
 
 func (s *SerialService) reconcileScheduledTaskStatusOnce(ctx context.Context, msgID string) error {
-	if s.scheduledTaskStatusUpdater == nil || s.textMsgService == nil {
+	updater := s.getScheduledTaskStatusUpdater()
+	if updater == nil || s.textMsgService == nil {
 		return nil
 	}
 	record, err := s.textMsgService.Get(ctx, msgID)
@@ -505,7 +508,7 @@ func (s *SerialService) reconcileScheduledTaskStatusOnce(ctx context.Context, ms
 		// 看到中间态，继续退避等待，不能把它误当作对账成功。
 		return fmt.Errorf("短信 %s 尚未进入可对账终态: %s", msgID, record.Status)
 	}
-	if err := s.scheduledTaskStatusUpdater(ctx, msgID, status); err != nil {
+	if err := updater(ctx, msgID, status); err != nil {
 		return err
 	}
 	s.stopScheduledTaskStatusRetry(msgID)
