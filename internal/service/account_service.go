@@ -167,7 +167,7 @@ func (s *AccountService) ValidateCredentials(ctx context.Context, username, pass
 func (s *AccountService) ValidateToken(tokenString string) (*JWTClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
 		// 验证签名方法
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		if token.Method != jwt.SigningMethodHS256 {
 			return nil, errors.New("无效的签名方法")
 		}
 		return []byte(s.jwtSecret), nil

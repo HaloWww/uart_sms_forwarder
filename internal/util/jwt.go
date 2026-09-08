@@ -45,7 +45,7 @@ func VerifyToken(tokenString string, secret string) (*CustomClaims, error) {
 	// 解析 token
 	token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
 		// 验证签名算法
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+		if token.Method != jwt.SigningMethodHS256 {
 			return nil, errors.New("无效的签名方法")
 		}
 		return []byte(secret), nil

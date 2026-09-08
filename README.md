@@ -20,6 +20,47 @@
 - 来电通知
 - 支持钉钉、企业微信、飞书、自定义 webhook、邮箱通知
 - 计划任务发送短信
+- 同时管理多台 Air780，短信、状态和计划任务按设备隔离
+- 串口断线重连、接收 ACK/去重和发送结果超时保护
+
+## 多设备配置
+
+每台 Air780 都需要烧录仓库中的 `main.lua`，然后在 `config.yaml` 中为每个 USB 串口配置稳定且唯一的设备 ID：
+
+```yaml
+App:
+  Serial:
+    Devices:
+      - ID: "air780-1"
+        Name: "主卡"
+        Port: "/dev/ttyUSB0"
+        Enabled: true
+      - ID: "air780-2"
+        Name: "备用卡"
+        Port: "/dev/ttyUSB1"
+        Enabled: true
+```
+
+Docker 部署时还需要将所有串口映射到容器：
+
+```yaml
+devices:
+  - /dev/ttyUSB0:/dev/ttyUSB0
+  - /dev/ttyUSB1:/dev/ttyUSB1
+```
+
+Web 顶部可以切换当前设备。发送短信、查看状态、短信会话、飞行模式和计划任务都会使用当前选择；计划任务会固定保存目标 `deviceId`。
+
+建议所有设备同步烧录新版 `main.lua`。新版主机连接后会主动协商开启接收 ACK；与旧版主机或旧版 Lua 组合时会自动退回原有无 ACK 模式。
+
+未配置 `Devices` 时仍兼容旧版 `App.Serial.Port`，系统会创建 ID 为 `default` 的设备，并在升级时把旧短信和计划任务迁移到该设备。
+
+主要 API：
+
+- `GET /api/serial/devices`：返回所有设备及状态
+- `GET /api/serial/status?deviceId=air780-1`：查询指定设备
+- `POST /api/serial/sms`：请求体增加可选的 `deviceId`
+- `POST /api/serial/flymode`、`POST /api/serial/reboot`：请求体支持 `deviceId`
 
 ## 截图
 

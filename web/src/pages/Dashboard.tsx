@@ -8,6 +8,7 @@ import {StatCard} from '@/components/StatsCard.tsx';
 import {getStatus} from '@/api/serial.ts';
 import {cn} from '@/lib/utils.ts';
 import {PageHeader} from '@/components/PageHeader';
+import {useDevice} from '@/providers/DeviceProvider';
 
 const describeSignal = (rsrp?: number) => {
     if (!rsrp) return '等待数据';
@@ -19,13 +20,14 @@ const describeSignal = (rsrp?: number) => {
 };
 
 export default function Dashboard() {
+    const {selectedDeviceId} = useDevice();
     const [stats, setStats] = useState<Stats | null>(null);
     const [statsLoading, setStatsLoading] = useState(true);
 
     useEffect(() => {
         const loadStats = async () => {
             try {
-                setStats(await getStats());
+                setStats(await getStats(selectedDeviceId));
             } catch (error) {
                 console.error('获取统计信息失败:', error);
             } finally {
@@ -36,11 +38,11 @@ export default function Dashboard() {
         loadStats();
         const interval = window.setInterval(loadStats, 30000);
         return () => window.clearInterval(interval);
-    }, []);
+    }, [selectedDeviceId]);
 
     const {data: deviceStatus, dataUpdatedAt, isFetching} = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus'],
-        queryFn: async () => getStatus() as Promise<DeviceStatus>,
+        queryKey: ['deviceStatus', selectedDeviceId],
+        queryFn: async () => getStatus(selectedDeviceId) as Promise<DeviceStatus>,
         refetchInterval: 10000,
     });
 

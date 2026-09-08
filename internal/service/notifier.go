@@ -33,31 +33,44 @@ func NewNotifier(logger *zap.Logger) *Notifier {
 
 // NotificationMessage 通用通知消息（支持短信、来电、飞行模式状态等）
 type NotificationMessage struct {
-	Type      string // "sms"、"call" 或 "flymode"
-	From      string
-	Content   string // 短信内容（来电时为空）
-	Timestamp int64
+	Type       string // "sms"、"call" 或 "flymode"
+	DeviceID   string
+	DeviceName string
+	From       string
+	Content    string // 短信内容（来电时为空）
+	Timestamp  int64
 }
 
 func (m NotificationMessage) String() string {
 	timestamp := time.Unix(m.Timestamp, 0)
+	device := m.DeviceName
+	if device == "" {
+		device = m.DeviceID
+	}
+	if device == "" {
+		device = "默认设备"
+	}
 	switch m.Type {
 	case "call":
 		return fmt.Sprintf(`来电通知
 ----
+设备: %s
 来电号码: %s
 时间: %s
 `,
+			device,
 			m.From,
 			timestamp.Format(time.DateTime),
 		)
 	case "flymode":
 		return fmt.Sprintf(`飞行模式通知
 ----
+设备: %s
 切换方式: %s
 %s
 时间: %s
 `,
+			device,
 			m.From,
 			m.Content,
 			timestamp.Format(time.DateTime),
@@ -65,10 +78,12 @@ func (m NotificationMessage) String() string {
 	default: // "sms"
 		return fmt.Sprintf(`%s
 ----
+设备: %s
 来自: %s
 时间: %s
 `,
 			m.Content,
+			device,
 			m.From,
 			timestamp.Format(time.DateTime),
 		)
@@ -175,13 +190,15 @@ func (n *Notifier) SendTelegramByConfig(ctx context.Context, config map[string]i
 }
 
 func (n *Notifier) sendTelegramByConfig(ctx context.Context, config map[string]interface{}, message string) error {
-	n.logger.Info("config:", zap.Any("config", config))
-	apitoken := config["apiToken"].(string)
-	userid := config["userid"].(string)
-	proxyEnabled := config["proxyEnabled"].(bool)
-	proxyUrl := config["proxyUrl"].(string)
-	proxyUsername := config["proxyUsername"].(string)
-	proxyPassword := config["proxyPassword"].(string)
+	apitoken, _ := config["apiToken"].(string)
+	userid, _ := config["userid"].(string)
+	if apitoken == "" || userid == "" {
+		return fmt.Errorf("Telegram 配置缺少 apiToken 或 userid")
+	}
+	proxyEnabled, _ := config["proxyEnabled"].(bool)
+	proxyUrl, _ := config["proxyUrl"].(string)
+	proxyUsername, _ := config["proxyUsername"].(string)
+	proxyPassword, _ := config["proxyPassword"].(string)
 
 	// 构建发送消息的URL
 	baseURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", apitoken)
@@ -261,6 +278,10 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 		case "timestamp":
 			timestamp := time.Unix(msg.Timestamp, 0).Format(time.DateTime)
 			v = timestamp
+		case "device_id":
+			v = msg.DeviceID
+		case "device_name":
+			v = msg.DeviceName
 		default:
 			return w.Write([]byte("{{" + tag + "}}"))
 		}
@@ -270,7 +291,10 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 	})
 	n.logger.Sugar().Debugf("自定义Webhook请求体: %s", bodyStr)
 	var reqBody = strings.NewReader(bodyStr)
-	var contentType = config["contentType"].(string)
+	contentType, _ := config["contentType"].(string)
+	if contentType == "" {
+		contentType = "application/json"
+	}
 
 	// 创建请求
 	req, err := http.NewRequestWithContext(ctx, method, webhookURL, reqBody)
@@ -305,7 +329,7 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 	}
 
 	n.logger.Info("自定义Webhook发送成功",
-		zap.String("url", webhookURL),
+		zap.String("host", requestHost(webhookURL)),
 		zap.String("method", method),
 		zap.String("response", string(respBody)),
 	)
@@ -344,7 +368,7 @@ func (n *Notifier) sendJSONRequest(ctx context.Context, url string, body interfa
 		return nil, fmt.Errorf("请求失败，状态码: %d, 响应: %s", resp.StatusCode, string(respBody))
 	}
 
-	n.logger.Info("通知发送成功", zap.String("url", url), zap.String("response", string(respBody)))
+	n.logger.Info("通知发送成功", zap.String("host", requestHost(url)), zap.String("response", string(respBody)))
 	return respBody, nil
 }
 
@@ -382,8 +406,16 @@ func (n *Notifier) sendJSONRequestWithProxy(ctx context.Context, url string, pro
 		return nil, fmt.Errorf("请求失败，状态码: %d, 响应: %s", resp.StatusCode, string(respBody))
 	}
 
-	n.logger.Info("通知发送成功", zap.String("url", url), zap.String("response", string(respBody)))
+	n.logger.Info("通知发送成功", zap.String("host", requestHost(url)), zap.String("response", string(respBody)))
 	return respBody, nil
+}
+
+func requestHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "invalid-url"
+	}
+	return parsed.Host
 }
 
 // sendDingTalkByConfig 根据配置发送钉钉通知

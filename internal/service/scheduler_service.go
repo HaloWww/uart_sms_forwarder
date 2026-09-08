@@ -20,19 +20,19 @@ type SchedulerService struct {
 	logger        *zap.Logger
 	cron          *cron.Cron
 	repo          *repo.ScheduledTaskRepo
-	serialService *SerialService
+	serialManager *SerialManager
 }
 
 // NewSchedulerService 创建定时任务服务实例
 func NewSchedulerService(
 	logger *zap.Logger,
 	db *gorm.DB,
-	serialService *SerialService,
+	serialManager *SerialManager,
 ) *SchedulerService {
 	return &SchedulerService{
 		logger:        logger,
 		repo:          repo.NewScheduledTaskRepo(db),
-		serialService: serialService,
+		serialManager: serialManager,
 	}
 }
 
@@ -73,6 +73,7 @@ func (s *SchedulerService) Update(ctx context.Context, task *models.ScheduledTas
 		return err
 	}
 	existingTask.Name = task.Name
+	existingTask.DeviceID = task.DeviceID
 	existingTask.Enabled = task.Enabled
 	existingTask.IntervalDays = task.IntervalDays
 	existingTask.PhoneNumber = task.PhoneNumber
@@ -189,7 +190,7 @@ func (s *SchedulerService) executeTask(task models.ScheduledTask) error {
 	ctx := context.Background()
 
 	// SendSMS 会统一处理飞行模式唤醒、等待网络注册及原手动状态恢复。
-	msgId, err := s.serialService.SendSMS(task.PhoneNumber, task.Content)
+	msgId, err := s.serialManager.SendSMS(task.DeviceID, task.PhoneNumber, task.Content)
 	if err != nil {
 		s.logger.Error("定时任务发送短信失败",
 			zap.String("id", task.ID),

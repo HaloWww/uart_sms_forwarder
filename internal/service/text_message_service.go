@@ -37,6 +37,7 @@ type Stats struct {
 
 // Conversation 会话信息
 type Conversation struct {
+	DeviceID     string              `json:"deviceId"`
 	Peer         string              `json:"peer"`         // 对方号码
 	LastMessage  *models.TextMessage `json:"lastMessage"`  // 最后一条消息
 	MessageCount int64               `json:"messageCount"` // 消息总数
@@ -76,9 +77,13 @@ func (s *TextMessageService) Delete(ctx context.Context, id string) error {
 }
 
 // Clear 清空所有短信记录
-func (s *TextMessageService) Clear(ctx context.Context) error {
+func (s *TextMessageService) Clear(ctx context.Context, deviceID string) error {
 	db := s.repo.GetDB(ctx)
-	if err := db.Where("1 = 1").Delete(&models.TextMessage{}).Error; err != nil {
+	query := db.Where("1 = 1")
+	if deviceID != "" {
+		query = query.Where("device_id = ?", deviceID)
+	}
+	if err := query.Delete(&models.TextMessage{}).Error; err != nil {
 		s.logger.Error("清空短信记录失败", zap.Error(err))
 		return fmt.Errorf("清空短信记录失败: %w", err)
 	}
@@ -87,8 +92,11 @@ func (s *TextMessageService) Clear(ctx context.Context) error {
 }
 
 // GetStats 获取统计信息
-func (s *TextMessageService) GetStats(ctx context.Context) (*Stats, error) {
+func (s *TextMessageService) GetStats(ctx context.Context, deviceID string) (*Stats, error) {
 	db := s.repo.GetDB(ctx)
+	if deviceID != "" {
+		db = db.Where("device_id = ?", deviceID)
+	}
 
 	stats := &Stats{}
 
@@ -123,8 +131,11 @@ func (s *TextMessageService) UpdateStatusById(ctx context.Context, id string, st
 }
 
 // GetConversations 获取会话列表（按对方号码分组）
-func (s *TextMessageService) GetConversations(ctx context.Context) ([]*Conversation, error) {
+func (s *TextMessageService) GetConversations(ctx context.Context, deviceID string) ([]*Conversation, error) {
 	db := s.repo.GetDB(ctx)
+	if deviceID != "" {
+		db = db.Where("device_id = ?", deviceID)
+	}
 
 	// 获取所有短信记录，按创建时间倒序
 	var messages []models.TextMessage
@@ -151,8 +162,10 @@ func (s *TextMessageService) GetConversations(ctx context.Context) ([]*Conversat
 		}
 
 		// 如果会话不存在，创建新会话
-		if _, exists := conversationMap[peer]; !exists {
-			conversationMap[peer] = &Conversation{
+		key := msg.DeviceID + "\x00" + peer
+		if _, exists := conversationMap[key]; !exists {
+			conversationMap[key] = &Conversation{
+				DeviceID:     msg.DeviceID,
 				Peer:         peer,
 				LastMessage:  msg,
 				MessageCount: 0,
@@ -161,11 +174,11 @@ func (s *TextMessageService) GetConversations(ctx context.Context) ([]*Conversat
 		}
 
 		// 更新消息数量
-		conversationMap[peer].MessageCount++
+		conversationMap[key].MessageCount++
 
 		// 更新最后一条消息（取最新的）
-		if msg.CreatedAt > conversationMap[peer].LastMessage.CreatedAt {
-			conversationMap[peer].LastMessage = msg
+		if msg.CreatedAt > conversationMap[key].LastMessage.CreatedAt {
+			conversationMap[key].LastMessage = msg
 		}
 	}
 
@@ -188,8 +201,11 @@ func (s *TextMessageService) GetConversations(ctx context.Context) ([]*Conversat
 }
 
 // GetConversationMessages 获取指定会话的所有消息
-func (s *TextMessageService) GetConversationMessages(ctx context.Context, peer string) ([]models.TextMessage, error) {
+func (s *TextMessageService) GetConversationMessages(ctx context.Context, deviceID, peer string) ([]models.TextMessage, error) {
 	db := s.repo.GetDB(ctx)
+	if deviceID != "" {
+		db = db.Where("device_id = ?", deviceID)
+	}
 
 	var messages []models.TextMessage
 
@@ -206,8 +222,11 @@ func (s *TextMessageService) GetConversationMessages(ctx context.Context, peer s
 }
 
 // DeleteConversation 删除整个会话（与某个联系人的所有消息）
-func (s *TextMessageService) DeleteConversation(ctx context.Context, peer string) error {
+func (s *TextMessageService) DeleteConversation(ctx context.Context, deviceID, peer string) error {
 	db := s.repo.GetDB(ctx)
+	if deviceID != "" {
+		db = db.Where("device_id = ?", deviceID)
+	}
 
 	// 删除条件：(type=incoming AND from=peer) OR (type=outgoing AND to=peer)
 	result := db.Where("(type = ? AND \"from\" = ?) OR (type = ? AND \"to\" = ?)",

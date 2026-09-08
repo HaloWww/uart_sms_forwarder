@@ -7,17 +7,18 @@ export const sendSMS = (data: SendSMSRequest) => {
 };
 
 // 获取设备状态（包含移动网络信息）
-export const getStatus = () => {
-  return apiClient.get('/serial/status');
-};
+export const getStatus = (deviceId?: string) =>
+  apiClient.get('/serial/status', {params: {deviceId}});
+
+export const getDevices = () => apiClient.get<import('./types').DeviceStatus[]>('/serial/devices');
 
 // 设置飞行模式
-export const setFlymode = (enabled: boolean) => {
-  return apiClient.post('/serial/flymode', { enabled });
+export const setFlymode = (enabled: boolean, deviceId?: string) => {
+  return apiClient.post('/serial/flymode', { enabled, deviceId });
 };
 
 // 重启模块
-export const rebootMcu = () => {
-  return apiClient.post('/serial/reboot');
+export const rebootMcu = (deviceId?: string) => {
+  return apiClient.post('/serial/reboot', {deviceId});
 };
 

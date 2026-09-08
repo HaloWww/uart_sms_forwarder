@@ -24,8 +24,10 @@ import {
 import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query';
 import type {Conversation, DeviceStatus, TextMessage} from '@/api/types';
 import {PageHeader} from '@/components/PageHeader';
+import {useDevice} from '@/providers/DeviceProvider';
 
 export default function Messages() {
+    const {selectedDeviceId} = useDevice();
     const queryClient = useQueryClient();
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const [searchParams, setSearchParams] = useSearchParams();
@@ -59,23 +61,23 @@ export default function Messages() {
 
     // 使用新的会话列表 API
     const {data: conversations = [], isLoading, refetch} = useQuery<Conversation[]>({
-        queryKey: ['conversations'],
-        queryFn: getConversations,
+        queryKey: ['conversations', selectedDeviceId],
+        queryFn: () => getConversations(selectedDeviceId),
         refetchInterval: 5000, // 每 5 秒自动刷新
     });
 
     const {data: deviceStatus} = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus'],
-        queryFn: async () => getStatus() as Promise<DeviceStatus>,
+        queryKey: ['deviceStatus', selectedDeviceId],
+        queryFn: async () => getStatus(selectedDeviceId) as Promise<DeviceStatus>,
         refetchInterval: 10000,
     });
 
     // 获取指定会话的所有消息
     const {data: currentMessages = []} = useQuery<TextMessage[]>({
-        queryKey: ['conversation-messages', selectedPeer],
+        queryKey: ['conversation-messages', selectedDeviceId, selectedPeer],
         queryFn: () => {
             if (!selectedPeer) return Promise.resolve([]);
-            return getConversationMessages(selectedPeer);
+            return getConversationMessages(selectedPeer, selectedDeviceId);
         },
         enabled: !!selectedPeer,
         refetchInterval: 5000,
@@ -83,7 +85,7 @@ export default function Messages() {
 
     // 发送短信 Mutation
     const sendSMSMutation = useMutation({
-        mutationFn: (data: { to: string; content: string }) => sendSMS(data),
+        mutationFn: (data: { to: string; content: string }) => sendSMS({...data, deviceId: selectedDeviceId}),
         onSuccess: (_, variables) => {
             setInputText('');
             setNewRecipient('');
@@ -106,7 +108,7 @@ export default function Messages() {
 
     // 清空所有短信
     const clearMutation = useMutation({
-        mutationFn: clearMessages,
+        mutationFn: () => clearMessages(selectedDeviceId),
         onSuccess: () => {
             toast.success('清空成功');
             setSelectedPeer(null);
@@ -121,7 +123,7 @@ export default function Messages() {
 
     // 删除整个会话
     const deleteConversationMutation = useMutation({
-        mutationFn: (peer: string) => deleteConversation(peer),
+        mutationFn: (peer: string) => deleteConversation(peer, selectedDeviceId),
         onSuccess: (_, peer) => {
             toast.success('会话已删除');
             // 如果删除的是当前选中的会话，清除选中状态

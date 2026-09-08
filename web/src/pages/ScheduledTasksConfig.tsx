@@ -25,8 +25,10 @@ import {
 } from '../api/scheduled_task';
 import {PageHeader} from '@/components/PageHeader';
 import {cn} from '@/lib/utils';
+import {useDevice} from '@/providers/DeviceProvider';
 
 interface TaskFormData {
+    deviceId: string;
     name: string;
     enabled: boolean;
     intervalDays: number;
@@ -40,6 +42,7 @@ interface ConfirmationState {
 }
 
 const EMPTY_FORM: TaskFormData = {
+    deviceId: '',
     name: '',
     enabled: false,
     intervalDays: 90,
@@ -69,6 +72,7 @@ const lastRunDisplay = (status?: LastRunStatus) => {
 };
 
 export default function ScheduledTasksConfig() {
+    const {devices, selectedDeviceId} = useDevice();
     const queryClient = useQueryClient();
     const [editorOpen, setEditorOpen] = useState(false);
     const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
@@ -144,13 +148,14 @@ export default function ScheduledTasksConfig() {
 
     const openAddEditor = () => {
         setEditingTask(null);
-        setFormData({...EMPTY_FORM});
+        setFormData({...EMPTY_FORM, deviceId: selectedDeviceId});
         setEditorOpen(true);
     };
 
     const openEditEditor = (task: ScheduledTask) => {
         setEditingTask(task);
         setFormData({
+            deviceId: task.deviceId || selectedDeviceId,
             name: task.name,
             enabled: task.enabled,
             intervalDays: task.intervalDays,
@@ -162,6 +167,10 @@ export default function ScheduledTasksConfig() {
 
     const handleSubmit = (event: React.FormEvent) => {
         event.preventDefault();
+        if (!formData.deviceId) {
+            toast.warning('请选择发送设备');
+            return;
+        }
         if (!formData.name.trim()) {
             toast.warning('请输入任务名称');
             return;
@@ -250,7 +259,9 @@ export default function ScheduledTasksConfig() {
                                     </span>
                                     <div className="min-w-0">
                                         <p className="truncate text-sm font-bold text-slate-900">{task.name}</p>
-                                        <p className="mt-1 line-clamp-1 text-xs text-slate-500">{task.content}</p>
+                                        <p className="mt-1 line-clamp-1 text-xs text-slate-500">
+                                            {(devices.find((device) => device.device_id === task.deviceId)?.device_name || task.deviceId || '默认设备')} · {task.content}
+                                        </p>
                                     </div>
                                 </div>
                                 <div className="text-sm font-semibold text-slate-700">
@@ -318,6 +329,18 @@ export default function ScheduledTasksConfig() {
                         </DialogHeader>
 
                         <div className="space-y-5 py-5">
+                            <div className="space-y-1.5">
+                                <label htmlFor="task-device" className="block text-sm font-medium text-slate-800">发送设备</label>
+                                <select
+                                    id="task-device"
+                                    value={formData.deviceId}
+                                    onChange={(event) => updateFormField('deviceId', event.target.value)}
+                                    className="h-10 w-full rounded-md border border-slate-200 bg-slate-50 px-3 text-sm outline-none focus:border-blue-400 focus:bg-white"
+                                >
+                                    <option value="">请选择 Air780</option>
+                                    {devices.map((device) => <option key={device.device_id} value={device.device_id}>{device.device_name || device.device_id}</option>)}
+                                </select>
+                            </div>
                             <div className="space-y-1.5">
                                 <label htmlFor="task-name" className="block text-sm font-medium text-slate-800">任务名称</label>
                                 <Input id="task-name" value={formData.name} onChange={(event) => updateFormField('name', event.target.value)} placeholder="例如：90 天流量查询" className="bg-slate-50 focus:bg-white" autoFocus/>

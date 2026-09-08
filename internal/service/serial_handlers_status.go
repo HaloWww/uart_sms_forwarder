@@ -7,10 +7,12 @@ import (
 )
 
 type StatusData struct {
-	Flymode bool   `json:"flymode"` // 设备当前是否为飞行模式
-	Type    string `json:"type"`    // 消息类型
-	Version string `json:"version"` // Lua 脚本版本
-	Mobile  struct {
+	DeviceID   string `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	Flymode    bool   `json:"flymode"` // 设备当前是否为飞行模式
+	Type       string `json:"type"`    // 消息类型
+	Version    string `json:"version"` // Lua 脚本版本
+	Mobile     struct {
 		IsRegistered bool    `json:"is_registered"`
 		IsRoaming    bool    `json:"is_roaming"`
 		Iccid        string  `json:"iccid"`
@@ -38,6 +40,8 @@ func (s *SerialService) handleStatusResponse(msg *ParsedMessage) {
 		s.logger.Error("JSON解析失败", zap.Error(err), zap.String("data", msg.JSON))
 		return
 	}
+	statusData.DeviceID = s.deviceID
+	statusData.DeviceName = s.deviceName
 	imsi := statusData.Mobile.Imsi
 	if len(imsi) > 5 {
 		plmn := imsi[:5]

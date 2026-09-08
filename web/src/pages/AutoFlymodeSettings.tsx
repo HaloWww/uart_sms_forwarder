@@ -14,11 +14,13 @@ import {
 import {getStatus} from '@/api/serial';
 import type {DeviceStatus} from '@/api/types';
 import {PageHeader} from '@/components/PageHeader';
+import {useDevice} from '@/providers/DeviceProvider';
 
 const MIN_IDLE_HOURS = 1;
 const MAX_IDLE_HOURS = 30 * 24;
 
 export default function AutoFlymodeSettings() {
+    const {selectedDeviceId} = useDevice();
     const queryClient = useQueryClient();
     const [draft, setDraft] = useState<{enabled: boolean; idleTimeoutHours: string} | null>(null);
 
@@ -28,8 +30,8 @@ export default function AutoFlymodeSettings() {
     });
 
     const statusQuery = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus'],
-        queryFn: async () => getStatus() as Promise<DeviceStatus>,
+        queryKey: ['deviceStatus', selectedDeviceId],
+        queryFn: async () => getStatus(selectedDeviceId) as Promise<DeviceStatus>,
         refetchInterval: 10000,
     });
 

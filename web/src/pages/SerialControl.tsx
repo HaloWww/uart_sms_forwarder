@@ -10,6 +10,7 @@ import type {DeviceStatus} from '@/api/types';
 import {formatUptime} from '@/utils/utils.ts';
 import {PageHeader} from '@/components/PageHeader';
 import {cn} from '@/lib/utils';
+import {useDevice} from '@/providers/DeviceProvider';
 
 interface InfoRowProps {
     label: string;
@@ -51,22 +52,23 @@ function StatusTile({label, value, tone = 'slate'}: StatusTileProps) {
 }
 
 export default function SerialControl() {
+    const {selectedDeviceId} = useDevice();
     const {
         data: deviceStatus,
         isFetching,
         isLoading,
         refetch: refetchStatus,
     } = useQuery({
-        queryKey: ['deviceStatus'],
+        queryKey: ['deviceStatus', selectedDeviceId],
         queryFn: async () => {
-            const res = await serialApi.getStatus();
+            const res = await serialApi.getStatus(selectedDeviceId);
             return res as DeviceStatus;
         },
         refetchInterval: 10000,
     });
 
     const setFlymodeMutation = useMutation({
-        mutationFn: (enabled: boolean) => serialApi.setFlymode(enabled),
+        mutationFn: (enabled: boolean) => serialApi.setFlymode(enabled, selectedDeviceId),
         onSuccess: () => {
             toast.success('设置成功');
             refetchStatus();
@@ -78,7 +80,7 @@ export default function SerialControl() {
     });
 
     const rebootMcuMutation = useMutation({
-        mutationFn: () => serialApi.rebootMcu(),
+        mutationFn: () => serialApi.rebootMcu(selectedDeviceId),
         onSuccess: () => {
             toast.success('模块重启命令已发送');
             refetchStatus();

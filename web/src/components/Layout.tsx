@@ -16,9 +16,8 @@ import {
 import {useQuery} from '@tanstack/react-query';
 import {toast} from 'sonner';
 import {getVersion} from '@/api/property.ts';
-import {getStatus} from '@/api/serial.ts';
-import type {DeviceStatus} from '@/api/types.ts';
 import {cn} from '@/lib/utils.ts';
+import {useDevice} from '@/providers/DeviceProvider';
 
 const navigation = [
     {name: '概览', description: '运行状态与数据', href: '/', icon: LayoutDashboard},
@@ -33,16 +32,11 @@ export default function Layout() {
     const location = useLocation();
     const navigate = useNavigate();
     const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+    const {devices, selectedDeviceId, setSelectedDeviceId, selectedDevice: deviceStatus} = useDevice();
 
     const versionQuery = useQuery({
         queryKey: ['version'],
         queryFn: getVersion,
-    });
-
-    const {data: deviceStatus} = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus'],
-        queryFn: async () => getStatus() as Promise<DeviceStatus>,
-        refetchInterval: 10000,
     });
 
     useEffect(() => {
@@ -192,6 +186,20 @@ export default function Layout() {
                             <span className="text-slate-700">{activeItem.name}</span>
                         </div>
                         <div className="ml-auto flex items-center gap-3">
+                            {devices.length > 0 && (
+                                <select
+                                    aria-label="当前 Air780 设备"
+                                    value={selectedDeviceId}
+                                    onChange={(event) => setSelectedDeviceId(event.target.value)}
+                                    className="h-8 max-w-44 rounded-lg border border-slate-200 bg-white px-2 text-xs font-semibold text-slate-700 outline-none focus:border-blue-400"
+                                >
+                                    {devices.map((device) => (
+                                        <option key={device.device_id} value={device.device_id}>
+                                            {device.device_name || device.device_id}{device.connected ? '' : '（离线）'}
+                                        </option>
+                                    ))}
+                                </select>
+                            )}
                             <div className={cn(
                                 'hidden items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold sm:flex',
                                 deviceStatus?.connected

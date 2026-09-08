@@ -11,6 +11,7 @@ import NotificationChannels from './pages/NotificationChannels';
 import ScheduledTasksConfig from './pages/ScheduledTasksConfig';
 import AutoFlymodeSettings from './pages/AutoFlymodeSettings';
 import {Toaster} from "@/components/ui/sonner.tsx";
+import {DeviceProvider} from '@/providers/DeviceProvider';
 
 function App() {
     return (
@@ -26,7 +27,7 @@ function App() {
                         path="/"
                         element={
                             <ProtectedRoute>
-                                <Layout/>
+                                <DeviceProvider><Layout/></DeviceProvider>
                             </ProtectedRoute>
                         }
                     >

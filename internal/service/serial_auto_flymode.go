@@ -119,10 +119,12 @@ func (s *SerialService) notifyFlymodeChanged(source flymodeChangeSource, enabled
 	}
 
 	go s.sendNotificationMessage(context.Background(), NotificationMessage{
-		Type:      "flymode",
-		From:      string(source),
-		Content:   content,
-		Timestamp: time.Now().Unix(),
+		Type:       "flymode",
+		DeviceID:   s.deviceID,
+		DeviceName: s.deviceName,
+		From:       string(source),
+		Content:    content,
+		Timestamp:  time.Now().Unix(),
 	})
 }
 

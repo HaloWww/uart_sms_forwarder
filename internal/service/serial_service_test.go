@@ -20,7 +20,7 @@ func TestWriteAllHandlesShortWrites(t *testing.T) {
 }
 
 func TestGetStatusReturnsCopy(t *testing.T) {
-	service := NewSerialService(zap.NewNop(), config.SerialConfig{}, nil, nil, nil)
+	service := NewSerialService(zap.NewNop(), config.SerialConfig{}, "default", "Air780", nil, nil, nil)
 	cached := &StatusData{Version: "1.0.4", PortName: "cached"}
 	service.deviceCache.Set(CacheKeyDeviceStatus, cached, CacheTTL)
 	service.setPortName("active")

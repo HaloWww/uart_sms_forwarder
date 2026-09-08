@@ -36,6 +36,8 @@ type ScheduledTaskStatusUpdater func(ctx context.Context, msgID string, status m
 type SerialService struct {
 	logger                     *zap.Logger
 	config                     config.SerialConfig
+	deviceID                   string
+	deviceName                 string
 	port                       serial.Port
 	textMsgService             *TextMessageService
 	notifier                   *Notifier
@@ -60,12 +62,15 @@ type SerialService struct {
 	smsOperationRunning atomic.Bool
 	manualFlymodeGen    atomic.Uint64
 	restoreFlymodeByMsg sync.Map
+	pendingSMSTimers    sync.Map
 }
 
 // NewSerialService 创建串口服务实例
 func NewSerialService(
 	logger *zap.Logger,
 	config config.SerialConfig,
+	deviceID string,
+	deviceName string,
 	textMsgService *TextMessageService,
 	notifier *Notifier,
 	propertyService *PropertyService,
@@ -73,6 +78,9 @@ func NewSerialService(
 	service := &SerialService{
 		logger:          logger,
 		config:          config,
+		deviceID:        deviceID,
+		deviceName:      deviceName,
+		portName:        config.Port,
 		textMsgService:  textMsgService,
 		notifier:        notifier,
 		propertyService: propertyService,
@@ -82,6 +90,9 @@ func NewSerialService(
 	service.initMessageHandlers()
 	return service
 }
+
+func (s *SerialService) DeviceID() string   { return s.deviceID }
+func (s *SerialService) DeviceName() string { return s.deviceName }
 
 func (s *SerialService) SetScheduledTaskStatusUpdater(updater ScheduledTaskStatusUpdater) {
 	s.scheduledTaskStatusUpdater = updater
@@ -192,6 +203,10 @@ func (s *SerialService) runOnce(resetBackoff func()) error {
 	s.wg.Add(1)
 	go s.periodicCacheUpdate(connCtx)
 
+	// 新版 Lua 支持短信接收确认；旧版会忽略为 unknown command，仍可继续工作。
+	if err := s.sendJSONCommand(map[string]string{"action": "enable_sms_ack"}); err != nil {
+		s.logger.Warn("启用短信接收确认失败", zap.Error(err))
+	}
 	// 首次立即发送缓存更新请求
 	go s.RequestCacheUpdate()
 
@@ -392,13 +407,15 @@ func (s *SerialService) SendSMS(to, content string) (string, error) {
 	ctx := context.Background()
 	msgID := uuid.NewString()
 	msg := &models.TextMessage{
-		ID:        msgID,
-		From:      "", // 发送方是本机
-		To:        to,
-		Content:   content,
-		Type:      models.MessageTypeOutgoing,
-		Status:    models.MessageStatusSending, // 初始状态为发送中
-		CreatedAt: time.Now().UnixMilli(),
+		ID:         msgID,
+		DeviceID:   s.deviceID,
+		DeviceName: s.deviceName,
+		From:       "", // 发送方是本机
+		To:         to,
+		Content:    content,
+		Type:       models.MessageTypeOutgoing,
+		Status:     models.MessageStatusSending, // 初始状态为发送中
+		CreatedAt:  time.Now().UnixMilli(),
 	}
 
 	if err := s.textMsgService.Save(ctx, msg); err != nil {
@@ -420,7 +437,10 @@ func (s *SerialService) SendSMS(to, content string) (string, error) {
 		"request_id": msgID,
 	}
 
+	// 必须先登记超时，再写串口，避免设备极快返回结果造成竞态。
+	s.startSMSSendTimeout(msgID)
 	if err := s.sendJSONCommand(cmd); err != nil {
+		s.stopSMSSendTimeout(msgID)
 		s.logger.Error("发送短信命令失败", zap.Error(err))
 		// 更新状态为失败
 		_ = s.textMsgService.UpdateStatusById(ctx, msgID, models.MessageStatusFailed)
@@ -437,6 +457,30 @@ func (s *SerialService) SendSMS(to, content string) (string, error) {
 	return msgID, nil
 }
 
+const smsSendResultTimeout = 2 * time.Minute
+
+func (s *SerialService) startSMSSendTimeout(msgID string) {
+	timer := time.AfterFunc(smsSendResultTimeout, func() {
+		s.pendingSMSTimers.Delete(msgID)
+		ctx := context.Background()
+		if err := s.textMsgService.UpdateStatusById(ctx, msgID, models.MessageStatusFailed); err != nil {
+			s.logger.Error("短信发送结果超时，更新状态失败", zap.String("request_id", msgID), zap.Error(err))
+		}
+		s.updateScheduledTaskStatus(ctx, msgID, models.LastRunStatusFailed)
+		s.restoreManualFlymodeAfterResult(msgID)
+		s.logger.Warn("等待短信发送结果超时", zap.String("request_id", msgID), zap.String("device_id", s.deviceID))
+	})
+	s.pendingSMSTimers.Store(msgID, timer)
+}
+
+func (s *SerialService) stopSMSSendTimeout(msgID string) {
+	if value, ok := s.pendingSMSTimers.LoadAndDelete(msgID); ok {
+		if timer, ok := value.(*time.Timer); ok {
+			timer.Stop()
+		}
+	}
+}
+
 // GetStatus 获取设备状态（从缓存读取，包含 mobile 信息和串口连接状态）
 func (s *SerialService) GetStatus() (*StatusData, error) {
 	// 获取连接信息
@@ -449,6 +493,8 @@ func (s *SerialService) GetStatus() (*StatusData, error) {
 		// 更新串口连接信息
 		snapshot.PortName = portName
 		snapshot.Connected = connected
+		snapshot.DeviceID = s.deviceID
+		snapshot.DeviceName = s.deviceName
 
 		// 更新飞行模式状态
 		snapshot.Flymode = s.FlyMode()
@@ -457,8 +503,10 @@ func (s *SerialService) GetStatus() (*StatusData, error) {
 
 	// 缓存未命中，但仍然返回连接状态
 	status := &StatusData{
-		PortName:  portName,
-		Connected: connected,
+		DeviceID:   s.deviceID,
+		DeviceName: s.deviceName,
+		PortName:   portName,
+		Connected:  connected,
 	}
 	return status, nil
 }

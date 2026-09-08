@@ -13,6 +13,7 @@ import (
 
 // IncomingSMS 接收的短信消息结构
 type IncomingSMS struct {
+	MessageID string `json:"message_id"`
 	Timestamp int64  `json:"timestamp"`
 	From      string `json:"from"`
 	Content   string `json:"content"`
@@ -49,32 +50,59 @@ func (s *SerialService) handleIncomingSMS(msg *ParsedMessage) {
 
 	// 保存短信记录
 	ctx := context.Background()
+	recordID := uuid.NewString()
+	sourceID := recordID
+	if sms.MessageID != "" {
+		recordID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(s.deviceID+":"+sms.MessageID)).String()
+		sourceID = sms.MessageID
+	}
 	record := &models.TextMessage{
-		ID:        uuid.NewString(),
-		From:      sms.From,
-		To:        "", // 接收方是本机
-		Content:   sms.Content,
-		Type:      models.MessageTypeIncoming,
-		Status:    models.MessageStatusReceived,
-		CreatedAt: time.Now().UnixMilli(),
+		ID:         recordID,
+		DeviceID:   s.deviceID,
+		DeviceName: s.deviceName,
+		SourceID:   sourceID,
+		From:       sms.From,
+		To:         "", // 接收方是本机
+		Content:    sms.Content,
+		Type:       models.MessageTypeIncoming,
+		Status:     models.MessageStatusReceived,
+		CreatedAt:  time.Now().UnixMilli(),
+	}
+	if sms.MessageID != "" {
+		if _, err := s.textMsgService.Get(ctx, recordID); err == nil {
+			s.ackIncomingSMS(sms.MessageID)
+			return
+		}
 	}
 
 	if err := s.textMsgService.Save(ctx, record); err != nil {
 		s.logger.Error("保存短信记录失败", zap.Error(err))
+		return
+	}
+	if sms.MessageID != "" {
+		s.ackIncomingSMS(sms.MessageID)
 	}
 
 	// 异步发送通知
 	go s.sendNotification(ctx, sms)
 }
 
+func (s *SerialService) ackIncomingSMS(messageID string) {
+	if err := s.sendJSONCommand(map[string]any{"action": "ack_sms", "message_id": messageID}); err != nil {
+		s.logger.Warn("发送短信接收确认失败", zap.String("message_id", messageID), zap.Error(err))
+	}
+}
+
 // sendNotification 发送通知
 func (s *SerialService) sendNotification(ctx context.Context, sms IncomingSMS) {
 	// 转换为通用通知消息
 	msg := NotificationMessage{
-		Type:      "sms",
-		From:      sms.From,
-		Content:   sms.Content,
-		Timestamp: sms.Timestamp,
+		Type:       "sms",
+		DeviceID:   s.deviceID,
+		DeviceName: s.deviceName,
+		From:       sms.From,
+		Content:    sms.Content,
+		Timestamp:  sms.Timestamp,
 	}
 
 	s.sendNotificationMessage(ctx, msg)
@@ -134,6 +162,7 @@ func (s *SerialService) handleSMSSendResult(msg *ParsedMessage) {
 		s.logger.Warn("收到短信发送结果但缺少 request_id", zap.Any("msg", msg.Payload))
 		return
 	}
+	s.stopSMSSendTimeout(requestID)
 
 	ctx := context.Background()
 	var status models.MessageStatus
@@ -152,10 +181,12 @@ func (s *SerialService) handleSMSSendResult(msg *ParsedMessage) {
 			zap.String("to", to),
 			zap.String("request_id", requestID))
 		go s.sendNotificationMessage(context.Background(), NotificationMessage{
-			Type:      "sms",
-			From:      "UART 短信转发器",
-			Content:   fmt.Sprintf("短信发送失败: %s", to),
-			Timestamp: time.Now().Unix(),
+			Type:       "sms",
+			DeviceID:   s.deviceID,
+			DeviceName: s.deviceName,
+			From:       "UART 短信转发器",
+			Content:    fmt.Sprintf("短信发送失败: %s", to),
+			Timestamp:  time.Now().Unix(),
 		})
 	}
 

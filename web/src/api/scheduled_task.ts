@@ -10,6 +10,7 @@ export interface ScheduledTask {
     intervalDays: number;
     phoneNumber: string;
     content: string;
+    deviceId: string;
     createdAt?: number;
     lastRunAt?: number;
     lastMsgId?: string;

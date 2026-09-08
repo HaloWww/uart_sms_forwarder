@@ -9,6 +9,8 @@ export interface TextMessage {
     timestamp: number;
     createdAt: number;
     updatedAt: number;
+    deviceId: string;
+    deviceName: string;
 }
 
 // 查询结果
@@ -27,6 +29,7 @@ export interface Stats {
 
 // 发送短信请求
 export interface SendSMSRequest {
+    deviceId?: string;
     to: string;
     content: string;
 }
@@ -56,6 +59,8 @@ export interface MobileInfo {
 
 // 设备状态响应（来自 Lua 脚本的 status_response）
 export interface DeviceStatus {
+    device_id: string;
+    device_name: string;
     type: string;                // 消息类型: "status_response"
     timestamp: number;           // 时间戳
     mem_kb: number;              // 内存使用 (KB)
@@ -75,6 +80,7 @@ export interface PhoneNumberResponse {
 
 // 会话信息
 export interface Conversation {
+    deviceId: string;
     peer: string;              // 对方号码
     lastMessage: TextMessage;  // 最后一条消息
     messageCount: number;      // 消息总数

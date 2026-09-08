@@ -20,6 +20,7 @@ services:
     # 如果需要访问串口设备，取消以下注释并修改设备路径，每个人设备类型不同，USB 设备路径可能不同，建议根据实际情况修改，/dev/ttyUSB0 只是示例
     # devices:
     #   - /dev/ttyUSB0:/dev/ttyUSB0
+    #   - /dev/ttyUSB1:/dev/ttyUSB1
 
     environment:
       - TZ=Asia/Shanghai

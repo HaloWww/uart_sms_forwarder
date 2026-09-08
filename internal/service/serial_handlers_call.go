@@ -28,10 +28,12 @@ func (s *SerialService) handleIncomingCall(msg *ParsedMessage) {
 
 	// 转换为通用通知消息并发送
 	notifMsg := NotificationMessage{
-		Type:      "call",
-		From:      call.From,
-		Content:   "", // 来电无内容
-		Timestamp: call.Timestamp,
+		Type:       "call",
+		DeviceID:   s.deviceID,
+		DeviceName: s.deviceName,
+		From:       call.From,
+		Content:    "", // 来电无内容
+		Timestamp:  call.Timestamp,
 	}
 
 	go s.sendNotificationMessage(context.Background(), notifMsg)

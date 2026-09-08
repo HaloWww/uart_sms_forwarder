@@ -1,14 +1,14 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.0.4
+-- VERSION: 1.1.0
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 
 log.info("main", PROJECT, VERSION)
 
@@ -24,6 +24,8 @@ local msg_buffer = {}
 local send_queue = {}
 local uart_recv_buffer = ""
 local call_ring_count = 0  -- 来电响铃计数
+local message_sequence = 0
+local sms_ack_enabled = false
 
 -- ========== 关键：禁用自动数据连接 ==========
 mobile.setAuto(0)
@@ -91,6 +93,11 @@ function send_to_uart(data)
     end
 end
 
+local function next_message_id()
+    message_sequence = message_sequence + 1
+    return string.format("%s-%d-%d", mobile.iccid() or "unknown", os.time(), message_sequence)
+end
+
 function process_uart_command(cmd_data)
     if not cmd_data.action then
         send_to_uart({type = "error", msg = "missing action"})
@@ -125,6 +132,13 @@ function process_uart_command(cmd_data)
             version = VERSION,
             mobile = get_mobile_info()
         })
+
+    elseif cmd_data.action == "ack_sms" and cmd_data.message_id then
+        sys.publish("SMS_ACK_" .. tostring(cmd_data.message_id))
+
+    elseif cmd_data.action == "enable_sms_ack" then
+        sms_ack_enabled = true
+        send_to_uart({type = "cmd_response", action = "enable_sms_ack", result = "ok"})
 
     elseif cmd_data.action == "set_flymode" and cmd_data.enabled ~= nil then
         -- 规范化为布尔值：兼容 true/false、1/0、"true"/"false"
@@ -170,6 +184,7 @@ sys.subscribe("SMS_INC", function(phone, content)
     log.info("Event", "收到短信:", phone)
     local msg = {
         type = "incoming_sms",
+        message_id = next_message_id(),
         timestamp = os.time(),
         from = phone,
         content = content
@@ -293,10 +308,23 @@ sys.taskInit(function()
             sys.waitUntil("NEW_MSG_IN_BUFFER")
         end
         while #msg_buffer > 0 do
-            local msg = table.remove(msg_buffer, 1)
+            local msg = msg_buffer[1]
             if msg then
                 send_to_uart(msg)
-                sys.wait(50)
+                if not sms_ack_enabled then
+                    table.remove(msg_buffer, 1)
+                else
+                    local acknowledged = sys.waitUntil("SMS_ACK_" .. msg.message_id, 5000)
+                    if acknowledged then
+                        table.remove(msg_buffer, 1)
+                    else
+                        -- 主机可能暂时离线，保留消息并稍后重试。
+                        table.remove(msg_buffer, 1)
+                        table.insert(msg_buffer, msg)
+                        log.warn("UART", "短信未收到主机确认，将重试", msg.message_id)
+                        sys.wait(1000)
+                    end
+                end
             end
         end
         if collectgarbage("count") > 1024 then

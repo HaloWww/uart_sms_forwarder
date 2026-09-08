@@ -11,6 +11,7 @@ const (
 // ScheduledTask 定时任务
 type ScheduledTask struct {
 	ID           string `gorm:"primaryKey" json:"id"`                  // UUID
+	DeviceID     string `gorm:"index" json:"deviceId"`                 // 发送设备；空值使用默认设备
 	Name         string `json:"name"`                                  // 任务名称
 	Enabled      bool   `json:"enabled"`                               // 是否启用
 	IntervalDays int    `json:"intervalDays"`                          // 执行间隔天数，例如 90 表示每90天执行一次
