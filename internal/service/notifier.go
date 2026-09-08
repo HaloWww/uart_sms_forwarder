@@ -36,13 +36,16 @@ type NotificationMessage struct {
 	Type       string // "sms"、"call" 或 "flymode"
 	DeviceID   string
 	DeviceName string
+	SIMID      string
+	ICCID      string
+	IMSI       string
+	IMEI       string
 	From       string
 	Content    string // 短信内容（来电时为空）
 	Timestamp  int64
 }
 
-func (m NotificationMessage) String() string {
-	timestamp := time.Unix(m.Timestamp, 0)
+func (m NotificationMessage) identitySummary() string {
 	device := m.DeviceName
 	if device == "" {
 		device = m.DeviceID
@@ -50,27 +53,46 @@ func (m NotificationMessage) String() string {
 	if device == "" {
 		device = "默认设备"
 	}
+	lines := []string{"设备: " + device}
+	if m.SIMID != "" {
+		lines = append(lines, "SIM: "+m.SIMID)
+	}
+	if m.ICCID != "" {
+		lines = append(lines, "ICCID: "+m.ICCID)
+	}
+	if m.IMSI != "" {
+		lines = append(lines, "IMSI: "+m.IMSI)
+	}
+	if m.IMEI != "" {
+		lines = append(lines, "IMEI: "+m.IMEI)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m NotificationMessage) String() string {
+	timestamp := time.Unix(m.Timestamp, 0)
+	identity := m.identitySummary()
 	switch m.Type {
 	case "call":
 		return fmt.Sprintf(`来电通知
 ----
-设备: %s
+%s
 来电号码: %s
 时间: %s
 `,
-			device,
+			identity,
 			m.From,
 			timestamp.Format(time.DateTime),
 		)
 	case "flymode":
 		return fmt.Sprintf(`飞行模式通知
 ----
-设备: %s
+%s
 切换方式: %s
 %s
 时间: %s
 `,
-			device,
+			identity,
 			m.From,
 			m.Content,
 			timestamp.Format(time.DateTime),
@@ -78,12 +100,12 @@ func (m NotificationMessage) String() string {
 	default: // "sms"
 		return fmt.Sprintf(`%s
 ----
-设备: %s
+%s
 来自: %s
 时间: %s
 `,
 			m.Content,
-			device,
+			identity,
 			m.From,
 			timestamp.Format(time.DateTime),
 		)
@@ -282,6 +304,14 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 			v = msg.DeviceID
 		case "device_name":
 			v = msg.DeviceName
+		case "sim_id":
+			v = msg.SIMID
+		case "iccid":
+			v = msg.ICCID
+		case "imsi":
+			v = msg.IMSI
+		case "imei":
+			v = msg.IMEI
 		default:
 			return w.Write([]byte("{{" + tag + "}}"))
 		}
@@ -547,6 +577,18 @@ func (n *Notifier) sendEmail(ctx context.Context, config map[string]interface{},
 				v = msg.Type
 			case "timestamp":
 				v = time.Unix(msg.Timestamp, 0).Format(time.DateTime)
+			case "device_id":
+				v = msg.DeviceID
+			case "device_name":
+				v = msg.DeviceName
+			case "sim_id":
+				v = msg.SIMID
+			case "iccid":
+				v = msg.ICCID
+			case "imsi":
+				v = msg.IMSI
+			case "imei":
+				v = msg.IMEI
 			default:
 				return w.Write([]byte("{{" + tag + "}}"))
 			}

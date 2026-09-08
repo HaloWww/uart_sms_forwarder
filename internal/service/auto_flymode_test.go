@@ -1,11 +1,16 @@
 package service
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/dushixiang/uart_sms_forwarder/config"
 	"github.com/dushixiang/uart_sms_forwarder/internal/models"
+	"github.com/glebarez/sqlite"
+	"go.uber.org/zap"
+	"gorm.io/gorm"
 )
 
 func TestValidateAutoFlymodeConfig(t *testing.T) {
@@ -74,5 +79,54 @@ func TestFlymodeNotificationMessage(t *testing.T) {
 		if !strings.Contains(message, want) {
 			t.Errorf("NotificationMessage.String() = %q, want it to contain %q", message, want)
 		}
+	}
+}
+
+func TestDisabledAutoFlymodeUsesSourceRecoveredAfterReconnect(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(uniqueTestSQLiteDSN("auto_flymode_reconnect")), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&models.Property{}); err != nil {
+		t.Fatal(err)
+	}
+	properties := NewPropertyService(zap.NewNop(), db)
+	if err := properties.InitializeDefaultConfigs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name     string
+		source   string
+		wantExit bool
+	}{
+		{name: "automatic owner", source: "automatic", wantExit: true},
+		{name: "manual owner", source: "manual", wantExit: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			service := NewSerialService(
+				zap.NewNop(), config.SerialConfig{}, "one", "设备一", nil, nil, properties,
+			)
+			port := &capturingSerialPort{}
+			service.port = port
+			autoRespondToControls(service, port, "ok", "")
+			service.setConnected(true)
+			service.handleStatusResponse(&ParsedMessage{JSON: `{
+				"type":"status_response",
+				"version":"1.3.0",
+				"flymode_owner_iccid":"8986000000000000001",
+				"flymode_source":"` + tt.source + `",
+				"mobile":{"flymode":true,"sim_ready":false}
+			}`})
+
+			wasEnabled := false
+			service.evaluateAutoFlymode(context.Background(), &wasEnabled)
+			if got := !service.FlyMode(); got != tt.wantExit {
+				t.Fatalf("exited flymode=%v, want %v", got, tt.wantExit)
+			}
+			if got := strings.Contains(port.String(), `"enabled":false`); got != tt.wantExit {
+				t.Fatalf("disable command=%v, want %v; frame=%q", got, tt.wantExit, port.String())
+			}
+		})
 	}
 }

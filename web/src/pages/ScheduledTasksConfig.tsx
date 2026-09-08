@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useRef, useState} from 'react';
 import {Calendar, CheckCircle2, Clock, Edit, Loader2, MessageSquare, Phone, Play, Plus, Trash2, XCircle} from 'lucide-react';
 import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query';
 import {toast} from 'sonner';
@@ -25,10 +25,12 @@ import {
 } from '../api/scheduled_task';
 import {PageHeader} from '@/components/PageHeader';
 import {cn} from '@/lib/utils';
-import {useDevice} from '@/providers/DeviceProvider';
+import {useSim} from '@/providers/SimContext';
+import {formatSimLabel, getErrorMessage, isAssignableSim, simAvailabilitySuffix, simIdentityTail} from '@/lib/sim';
+import {createRequestId, isDefinitiveAPIRejection} from '@/lib/request-id';
 
 interface TaskFormData {
-    deviceId: string;
+    simId: string;
     name: string;
     enabled: boolean;
     intervalDays: number;
@@ -42,7 +44,7 @@ interface ConfirmationState {
 }
 
 const EMPTY_FORM: TaskFormData = {
-    deviceId: '',
+    simId: '',
     name: '',
     enabled: false,
     intervalDays: 90,
@@ -50,13 +52,27 @@ const EMPTY_FORM: TaskFormData = {
     content: '',
 };
 
-const getErrorMessage = (error: unknown, fallback: string) => {
-    if (error && typeof error === 'object' && 'response' in error) {
-        const response = (error as {response?: {data?: {error?: unknown}}}).response;
-        if (typeof response?.data?.error === 'string') return response.data.error;
+const TRIGGER_REQUEST_STORAGE_KEY = 'uart-sms-forwarder:scheduled-trigger-requests:v1';
+
+function loadTriggerRequests(): Record<string, string> {
+    try {
+        const parsed = JSON.parse(window.localStorage.getItem(TRIGGER_REQUEST_STORAGE_KEY) || '{}') as unknown;
+        if (!parsed || typeof parsed !== 'object') return {};
+        return Object.fromEntries(
+            Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+        );
+    } catch {
+        return {};
     }
-    return fallback;
-};
+}
+
+function saveTriggerRequests(requests: Record<string, string>): void {
+    try {
+        window.localStorage.setItem(TRIGGER_REQUEST_STORAGE_KEY, JSON.stringify(requests));
+    } catch {
+        // 存储不可用时仍保留本次页面生命周期内的幂等键。
+    }
+}
 
 const lastRunDisplay = (status?: LastRunStatus) => {
     switch (status) {
@@ -64,6 +80,8 @@ const lastRunDisplay = (status?: LastRunStatus) => {
             return {text: '上次成功', icon: CheckCircle2, className: 'text-emerald-600'};
         case 'failed':
             return {text: '上次失败', icon: XCircle, className: 'text-rose-600'};
+        case 'ambiguous':
+            return {text: '上次待核实', icon: Clock, className: 'text-amber-600'};
         case 'unknown':
             return {text: '结果未知', icon: Clock, className: 'text-slate-500'};
         default:
@@ -72,12 +90,33 @@ const lastRunDisplay = (status?: LastRunStatus) => {
 };
 
 export default function ScheduledTasksConfig() {
-    const {devices, selectedDeviceId} = useDevice();
+    const {sims, selectedSimId} = useSim();
+    const assignableSims = sims.filter(isAssignableSim);
     const queryClient = useQueryClient();
     const [editorOpen, setEditorOpen] = useState(false);
     const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
     const [confirmation, setConfirmation] = useState<ConfirmationState | null>(null);
     const [formData, setFormData] = useState<TaskFormData>({...EMPTY_FORM});
+    const triggerRequestsRef = useRef<Record<string, string>>(loadTriggerRequests());
+
+    const getOrCreateTriggerRequest = (taskId: string) => {
+        const existing = triggerRequestsRef.current[taskId];
+        if (existing) return existing;
+        const requestId = createRequestId();
+        triggerRequestsRef.current = {...triggerRequestsRef.current, [taskId]: requestId};
+        // 必须先同步落盘再发请求，浏览器在响应前刷新也能复用同一 ID。
+        saveTriggerRequests(triggerRequestsRef.current);
+        return requestId;
+    };
+
+    const clearTriggerRequest = (taskId: string, requestId?: string) => {
+        if (requestId && triggerRequestsRef.current[taskId] !== requestId) return;
+        if (!(taskId in triggerRequestsRef.current)) return;
+        const next = {...triggerRequestsRef.current};
+        delete next[taskId];
+        triggerRequestsRef.current = next;
+        saveTriggerRequests(next);
+    };
 
     const {data: tasks = [], isLoading} = useQuery({
         queryKey: ['scheduledTasks'],
@@ -118,8 +157,9 @@ export default function ScheduledTasksConfig() {
 
     const deleteMutation = useMutation({
         mutationFn: deleteScheduledTask,
-        onSuccess: async () => {
+        onSuccess: async (_, taskId) => {
             await queryClient.invalidateQueries({queryKey: ['scheduledTasks']});
+            clearTriggerRequest(taskId);
             setConfirmation(null);
             toast.success('任务删除成功');
         },
@@ -131,13 +171,23 @@ export default function ScheduledTasksConfig() {
 
     const triggerMutation = useMutation({
         mutationFn: triggerScheduledTask,
-        onSuccess: async () => {
-            await queryClient.invalidateQueries({queryKey: ['scheduledTasks']});
-            setConfirmation(null);
-            toast.success('任务已触发执行');
+		onSuccess: async (result, variables) => {
+			await queryClient.invalidateQueries({queryKey: ['scheduledTasks']});
+			setConfirmation(null);
+			if (result.status === 'ambiguous') {
+                // 未确认结果继续保留 requestId；后续只查询/回放该次执行。
+                toast.warning(result.message);
+            } else {
+                clearTriggerRequest(variables.id, variables.requestId);
+                toast.success('任务已触发执行');
+            }
         },
-        onError: (error: unknown) => {
+        onError: (error: unknown, variables) => {
             console.error('触发任务失败:', error);
+            // 明确的 API 拒绝证明本次响应已知；网络断开则保留 requestId。
+            if (isDefinitiveAPIRejection(error)) {
+                clearTriggerRequest(variables.id, variables.requestId);
+            }
             toast.error(getErrorMessage(error, '触发任务失败'));
         },
     });
@@ -148,14 +198,16 @@ export default function ScheduledTasksConfig() {
 
     const openAddEditor = () => {
         setEditingTask(null);
-        setFormData({...EMPTY_FORM, deviceId: selectedDeviceId});
+        const selectedIsAssignable = assignableSims.some((sim) => sim.simId === selectedSimId);
+        setFormData({...EMPTY_FORM, simId: selectedIsAssignable ? selectedSimId : ''});
         setEditorOpen(true);
     };
 
     const openEditEditor = (task: ScheduledTask) => {
         setEditingTask(task);
         setFormData({
-            deviceId: task.deviceId || selectedDeviceId,
+            // 遗留任务必须由用户明确选择 SIM，绝不能回退到当前卡并静默改绑。
+            simId: task.simId && !task.simId.startsWith('legacy:') ? task.simId : '',
             name: task.name,
             enabled: task.enabled,
             intervalDays: task.intervalDays,
@@ -167,8 +219,8 @@ export default function ScheduledTasksConfig() {
 
     const handleSubmit = (event: React.FormEvent) => {
         event.preventDefault();
-        if (!formData.deviceId) {
-            toast.warning('请选择发送设备');
+        if (!formData.simId || formData.simId.startsWith('legacy:')) {
+            toast.warning('请选择发送 SIM');
             return;
         }
         if (!formData.name.trim()) {
@@ -212,6 +264,13 @@ export default function ScheduledTasksConfig() {
 
     const editorPending = createMutation.isPending || updateMutation.isPending;
     const confirmationPending = deleteMutation.isPending || triggerMutation.isPending;
+    const confirmationSim = confirmation
+        ? sims.find((sim) => sim.simId === confirmation.task.simId)
+        : undefined;
+    const confirmationCanTrigger = Boolean(
+        confirmationSim?.online && confirmationSim.scriptCompatible && confirmationSim.sendReady &&
+        !confirmationSim.conflict && isAssignableSim(confirmationSim),
+    );
 
     return (
         <div className="space-y-6 animate-in fade-in duration-300">
@@ -249,8 +308,16 @@ export default function ScheduledTasksConfig() {
                     {tasks.map((task) => {
                         const runState = lastRunDisplay(task.lastRunStatus);
                         const RunIcon = runState.icon;
-                        const triggering = triggerMutation.isPending && triggerMutation.variables === task.id;
+                        const triggering = triggerMutation.isPending && triggerMutation.variables?.id === task.id;
                         const deleting = deleteMutation.isPending && deleteMutation.variables === task.id;
+                        const taskSim = sims.find((sim) => sim.simId === task.simId);
+                        const taskCanTrigger = Boolean(
+                            taskSim?.online && taskSim.scriptCompatible && taskSim.sendReady &&
+                            !taskSim.conflict && isAssignableSim(taskSim),
+                        );
+                        const taskSimLabel = task.simId
+                            ? formatSimLabel(taskSim, task.simId)
+                            : task.deviceId ? `待绑定 SIM（原设备 ${task.deviceId}）` : '待绑定 SIM';
                         return (
                             <div key={task.id} className="grid gap-3 border-b border-slate-100 px-5 py-4 last:border-b-0 sm:grid-cols-2 xl:grid-cols-[minmax(190px,1.3fr)_84px_132px_148px_120px_176px] xl:items-center">
                                 <div className="flex min-w-0 items-start gap-3 sm:col-span-2 xl:col-span-1">
@@ -260,7 +327,9 @@ export default function ScheduledTasksConfig() {
                                     <div className="min-w-0">
                                         <p className="truncate text-sm font-bold text-slate-900">{task.name}</p>
                                         <p className="mt-1 line-clamp-1 text-xs text-slate-500">
-                                            {(devices.find((device) => device.device_id === task.deviceId)?.device_name || task.deviceId || '默认设备')} · {task.content}
+                                            {taskSimLabel}
+                                            {taskSim ? simAvailabilitySuffix(taskSim) : task.simId ? '（当前不可见）' : ''}
+                                            {' · '}{task.content}
                                         </p>
                                     </div>
                                 </div>
@@ -291,7 +360,12 @@ export default function ScheduledTasksConfig() {
                                         variant="outline"
                                         size="sm"
                                         onClick={() => setConfirmation({type: 'trigger', task})}
-                                        disabled={triggering}
+                                        disabled={triggering || !taskCanTrigger}
+                                        title={taskCanTrigger
+                                            ? '立即执行此任务'
+                                            : taskSim?.online && !taskSim.scriptCompatible
+                                                ? '请先升级目标 Air780 的 main.lua'
+                                                : '目标 SIM 离线、未识别或尚未绑定'}
                                         className="text-xs font-medium hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
                                     >
                                         {triggering ? <Loader2 className="size-3.5 animate-spin"/> : <Play className="size-3.5"/>}
@@ -330,15 +404,24 @@ export default function ScheduledTasksConfig() {
 
                         <div className="space-y-5 py-5">
                             <div className="space-y-1.5">
-                                <label htmlFor="task-device" className="block text-sm font-medium text-slate-800">发送设备</label>
+                                <label htmlFor="task-sim" className="block text-sm font-medium text-slate-800">发送 SIM</label>
                                 <select
-                                    id="task-device"
-                                    value={formData.deviceId}
-                                    onChange={(event) => updateFormField('deviceId', event.target.value)}
+                                    id="task-sim"
+                                    value={formData.simId}
+                                    onChange={(event) => updateFormField('simId', event.target.value)}
                                     className="h-10 w-full rounded-md border border-slate-200 bg-slate-50 px-3 text-sm outline-none focus:border-blue-400 focus:bg-white"
                                 >
-                                    <option value="">请选择 Air780</option>
-                                    {devices.map((device) => <option key={device.device_id} value={device.device_id}>{device.device_name || device.device_id}</option>)}
+                                    <option value="">请选择 SIM</option>
+                                    {formData.simId && !assignableSims.some((sim) => sim.simId === formData.simId) && (
+                                        <option value={formData.simId}>
+                                            {`SIM •${simIdentityTail(formData.simId) || '未知'}（当前不可见）`}
+                                        </option>
+                                    )}
+                                    {assignableSims.map((sim) => (
+                                        <option key={sim.simId} value={sim.simId}>
+                                            {formatSimLabel(sim)}{simAvailabilitySuffix(sim)}
+                                        </option>
+                                    ))}
                                 </select>
                             </div>
                             <div className="space-y-1.5">
@@ -411,9 +494,12 @@ export default function ScheduledTasksConfig() {
                             onClick={() => {
                                 if (!confirmation) return;
                                 if (confirmation.type === 'delete') deleteMutation.mutate(confirmation.task.id);
-                                else triggerMutation.mutate(confirmation.task.id);
+                                else triggerMutation.mutate({
+                                    id: confirmation.task.id,
+                                    requestId: getOrCreateTriggerRequest(confirmation.task.id),
+                                });
                             }}
-                            disabled={confirmationPending}
+                            disabled={confirmationPending || (confirmation?.type === 'trigger' && !confirmationCanTrigger)}
                             className={confirmation?.type === 'delete'
                                 ? 'bg-rose-600 text-white hover:bg-rose-700'
                                 : 'bg-blue-600 text-white hover:bg-blue-700'}

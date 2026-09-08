@@ -28,7 +28,24 @@ const (
 	CacheRefreshInterval = 10 * time.Second
 	// 缓存过期时间
 	CacheTTL = 5 * time.Minute
+	// 物理控制命令必须收到同一 request_id 的设备确认后才提交主机状态。
+	controlCommandResponseTimeout = 5 * time.Second
+	// 与 main.lua 的 max_uart_recv_buffer_size 保持一致。
+	MaxUARTCommandFrameBytes = 16 * 1024
 )
+
+var (
+	ErrSMSSubmissionAmbiguous = errors.New("短信命令可能已写入设备，发送状态不确定")
+	ErrSMSOperationPending    = errors.New("仍有短信等待设备最终结果")
+	ErrControlCommandRejected = errors.New("设备拒绝执行控制命令")
+	ErrControlCommandTimeout  = errors.New("等待设备确认控制命令超时")
+)
+
+type controlCommandResponse struct {
+	Action string
+	Result string
+	Error  string
+}
 
 type ScheduledTaskStatusUpdater func(ctx context.Context, msgID string, status models.LastRunStatus) error
 
@@ -43,6 +60,8 @@ type SerialService struct {
 	notifier                   *Notifier
 	propertyService            *PropertyService
 	handlers                   map[string]messageHandler
+	statusObserver             func(*StatusData)
+	simRouteValidator          func(deviceID string, identity SIMIdentity) error
 	scheduledTaskStatusUpdater ScheduledTaskStatusUpdater
 	wg                         sync.WaitGroup
 	// 设备信息缓存
@@ -53,16 +72,29 @@ type SerialService struct {
 	connected bool   // 连接状态
 	writeMu   sync.Mutex
 	smsSendMu sync.Mutex
+	// 每次串口重连、模块重启或 SIM 变化都会推进状态代际。业务路由只接受
+	// 当前代际的新状态，防止上一台模块/上一张卡的缓存被新连接复用。
+	statusEpoch     atomic.Uint64
+	statusAccepting atomic.Bool
+	statusMu        sync.Mutex
 
 	// 设备的飞行模式查询永远返回 false，无奈只能在应用层处理
-	flyMode atomic.Bool
+	flyMode           atomic.Bool
+	flymodeOwnerMu    sync.RWMutex
+	flymodeOwnerSIMID string
 	// 自动飞行模式运行状态
 	lastSMSActivityAt   atomic.Int64
 	autoFlymodeActive   atomic.Bool
 	smsOperationRunning atomic.Bool
 	manualFlymodeGen    atomic.Uint64
+	manualRestoreActive atomic.Bool
 	restoreFlymodeByMsg sync.Map
 	pendingSMSTimers    sync.Map
+	pendingControls     sync.Map
+	// 计划任务终态写入失败时，每个 messageId 最多启动一个后台对账循环。
+	scheduledTaskStatusRetries sync.Map
+	scheduledTaskRetryInitial  time.Duration
+	scheduledTaskRetryMax      time.Duration
 }
 
 // NewSerialService 创建串口服务实例
@@ -87,12 +119,23 @@ func NewSerialService(
 		deviceCache:     cache.New[string, *StatusData](CacheTTL),
 	}
 	service.lastSMSActivityAt.Store(time.Now().UnixMilli())
+	service.statusAccepting.Store(true)
 	service.initMessageHandlers()
 	return service
 }
 
 func (s *SerialService) DeviceID() string   { return s.deviceID }
 func (s *SerialService) DeviceName() string { return s.deviceName }
+
+func (s *SerialService) SetStatusObserver(observer func(*StatusData)) {
+	s.statusObserver = observer
+}
+
+func (s *SerialService) SetSIMRouteValidator(
+	validator func(deviceID string, identity SIMIdentity) error,
+) {
+	s.simRouteValidator = validator
+}
 
 func (s *SerialService) SetScheduledTaskStatusUpdater(updater ScheduledTaskStatusUpdater) {
 	s.scheduledTaskStatusUpdater = updater
@@ -115,12 +158,12 @@ func (s *SerialService) Start() {
 		// 连接失败或断开，使用 backoff 重试
 		if err != nil {
 			s.setConnected(false)
+			s.resetPhysicalConnectionState()
+			s.invalidateDeviceStatus(false)
 			retryAfter := b.Duration()
 			s.logger.Warn("串口连接异常，将重试",
 				zap.Error(err),
 				zap.Duration("retry_after", retryAfter))
-			s.deviceCache.Delete(CacheKeyDeviceStatus)
-
 			time.Sleep(retryAfter)
 		}
 	}
@@ -145,6 +188,39 @@ func (s *SerialService) getConnectionInfo() (portName string, connected bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.portName, s.connected
+}
+
+// invalidateDeviceStatus 原子地撤销当前状态代际。acceptNew 为 true 时，后续
+// 新回包可建立下一代状态；为 false 时（例如重启等待中）先拒绝所有状态。
+func (s *SerialService) invalidateDeviceStatus(acceptNew bool) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+	s.statusAccepting.Store(false)
+	s.statusEpoch.Add(1)
+	s.deviceCache.Delete(CacheKeyDeviceStatus)
+	s.statusAccepting.Store(acceptNew)
+}
+
+func (s *SerialService) setFlymodeOwner(simID string) {
+	s.flymodeOwnerMu.Lock()
+	s.flymodeOwnerSIMID = strings.TrimSpace(simID)
+	s.flymodeOwnerMu.Unlock()
+}
+
+func (s *SerialService) FlymodeOwnerSIMID() string {
+	s.flymodeOwnerMu.RLock()
+	defer s.flymodeOwnerMu.RUnlock()
+	return s.flymodeOwnerSIMID
+}
+
+// resetPhysicalConnectionState 撤销只对当前物理连接有效的控制状态。
+// 同一个串口重连后可能已是另一台模块，不能继承旧飞行模式所有者或恢复定时器。
+func (s *SerialService) resetPhysicalConnectionState() {
+	s.flyMode.Store(false)
+	s.autoFlymodeActive.Store(false)
+	s.setFlymodeOwner("")
+	s.manualFlymodeGen.Add(1)
+	s.recordSMSActivity()
 }
 
 // runOnce 执行一次连接尝试
@@ -182,6 +258,10 @@ func (s *SerialService) runOnce(resetBackoff func()) error {
 		return fmt.Errorf("连接串口失败: %w", err)
 	}
 
+	// 同名串口可能已经对应另一台模块；先撤销上一代缓存，再标记新连接在线。
+	s.setConnected(false)
+	s.resetPhysicalConnectionState()
+	s.invalidateDeviceStatus(true)
 	// 设置连接状态和串口名称
 	s.setPortName(selectedPort)
 	s.setConnected(true)
@@ -215,6 +295,8 @@ func (s *SerialService) runOnce(resetBackoff func()) error {
 
 	// 连接已断开，更新状态
 	s.setConnected(false)
+	s.resetPhysicalConnectionState()
+	s.invalidateDeviceStatus(false)
 
 	return nil
 }
@@ -390,63 +472,114 @@ func (s *SerialService) processReceivedData(data string) {
 	s.routeMessage(msg)
 }
 
-// SendSMS 发送短信
-func (s *SerialService) SendSMS(to, content string) (string, error) {
+// SendSMS 发送短信。expected 绑定目标 ICCID，避免换卡后通过错误 SIM 发送。
+func (s *SerialService) SendSMS(expected SIMIdentity, to, content, requestID string) (string, error) {
 	s.smsSendMu.Lock()
 	defer s.smsSendMu.Unlock()
 
 	s.smsOperationRunning.Store(true)
 	defer s.smsOperationRunning.Store(false)
+	if !s.FlyMode() {
+		if err := s.ensureSIMIdentity(expected); err != nil {
+			return "", err
+		}
+	}
 
-	restoreManualFlymode, manualFlymodeGen, err := s.prepareNetworkForSMS(context.Background())
+	restoreManualFlymode, manualFlymodeGen, err := s.prepareNetworkForSMS(context.Background(), expected)
 	if err != nil {
 		return "", err
+	}
+	if err := s.ensureSIMIdentity(expected); err != nil {
+		if restoreManualFlymode {
+			s.restoreManualFlymode(s.newManualFlymodeRestoreToken(expected, manualFlymodeGen))
+		}
+		return "", err
+	}
+	if s.simRouteValidator != nil {
+		if err := s.simRouteValidator(s.deviceID, expected); err != nil {
+			if restoreManualFlymode {
+				s.restoreManualFlymode(s.newManualFlymodeRestoreToken(expected, manualFlymodeGen))
+			}
+			return "", err
+		}
 	}
 
 	// 先保存发送记录，状态为 "sending"
 	ctx := context.Background()
-	msgID := uuid.NewString()
+	msgID := strings.TrimSpace(requestID)
+	if msgID == "" {
+		msgID = uuid.NewString()
+	}
 	msg := &models.TextMessage{
-		ID:         msgID,
-		DeviceID:   s.deviceID,
-		DeviceName: s.deviceName,
-		From:       "", // 发送方是本机
-		To:         to,
-		Content:    content,
-		Type:       models.MessageTypeOutgoing,
-		Status:     models.MessageStatusSending, // 初始状态为发送中
-		CreatedAt:  time.Now().UnixMilli(),
+		ID:               msgID,
+		DeviceID:         s.deviceID,
+		DeviceName:       s.deviceName,
+		SIMID:            expected.SIMID,
+		ICCID:            expected.ICCID,
+		IMSI:             expected.IMSI,
+		IMEI:             expected.IMEI,
+		MUID:             expected.MUID,
+		SIMSlot:          expected.SIMSlot,
+		IdentityRevision: expected.Revision,
+		From:             "", // 发送方是本机
+		To:               to,
+		Content:          content,
+		Type:             models.MessageTypeOutgoing,
+		Status:           models.MessageStatusSending, // 初始状态为发送中
+		CreatedAt:        time.Now().UnixMilli(),
 	}
 
-	if err := s.textMsgService.Save(ctx, msg); err != nil {
-		s.logger.Error("保存短信发送记录失败", zap.Error(err))
+	if err := s.textMsgService.PrepareClaimedOutgoingRequest(ctx, msg); err != nil {
+		s.logger.Error("补全短信发送记录失败", zap.Error(err))
 		if restoreManualFlymode {
-			s.restoreManualFlymode(manualFlymodeGen)
+			s.restoreManualFlymode(s.newManualFlymodeRestoreToken(expected, manualFlymodeGen))
 		}
 		return "", err
 	}
 	if restoreManualFlymode {
-		s.restoreFlymodeByMsg.Store(msgID, manualFlymodeGen)
+		s.restoreFlymodeByMsg.Store(
+			msgID,
+			s.newManualFlymodeRestoreToken(expected, manualFlymodeGen),
+		)
 	}
 
 	// 发送命令，使用消息 ID 作为 request_id
 	cmd := map[string]any{
-		"action":     "send_sms",
-		"to":         to,
-		"content":    content,
-		"request_id": msgID,
+		"action":         "send_sms",
+		"to":             to,
+		"content":        content,
+		"request_id":     msgID,
+		"expected_iccid": expected.ICCID,
 	}
 
 	// 必须先登记超时，再写串口，避免设备极快返回结果造成竞态。
 	s.startSMSSendTimeout(msgID)
 	if err := s.sendJSONCommand(cmd); err != nil {
+		if writeMayHaveReachedDevice(err) {
+			// 串口驱动可能在已经写出部分甚至全部字节后同时返回错误。此时
+			// 设备有机会完成发送，必须保留超时和计划任务登记，禁止按普通失败重试。
+			updated, updateErr := s.textMsgService.UpdateSendResultById(
+				ctx, msgID, models.MessageStatusAmbiguous, false, true, "serial_write_uncertain",
+			)
+			if updateErr != nil {
+				s.logger.Error("记录串口不确定写入失败", zap.String("request_id", msgID), zap.Error(updateErr))
+			}
+			if updated {
+				s.updateScheduledTaskStatus(ctx, msgID, models.LastRunStatusAmbiguous)
+			} else if updateErr == nil {
+				s.reconcileScheduledTaskStatus(ctx, msgID)
+			}
+			s.recordSMSActivity()
+			return msgID, fmt.Errorf("%w: %v", ErrSMSSubmissionAmbiguous, err)
+		}
 		s.stopSMSSendTimeout(msgID)
 		s.logger.Error("发送短信命令失败", zap.Error(err))
-		// 更新状态为失败
-		_ = s.textMsgService.UpdateStatusById(ctx, msgID, models.MessageStatusFailed)
+		_, _ = s.textMsgService.UpdateSendResultById(
+			ctx, msgID, models.MessageStatusFailed, false, false, "serial_write_failed",
+		)
 		s.restoreFlymodeByMsg.Delete(msgID)
 		if restoreManualFlymode {
-			s.restoreManualFlymode(manualFlymodeGen)
+			s.restoreManualFlymode(s.newManualFlymodeRestoreToken(expected, manualFlymodeGen))
 		}
 		return "", err
 	}
@@ -457,20 +590,87 @@ func (s *SerialService) SendSMS(to, content string) (string, error) {
 	return msgID, nil
 }
 
-const smsSendResultTimeout = 2 * time.Minute
+func (s *SerialService) ensureSIMIdentity(expected SIMIdentity) error {
+	if expected.SIMID == "" || expected.ICCID == "" {
+		return ErrSIMIdentityRequired
+	}
+	status, _ := s.GetStatus()
+	actual := identityFromStatus(status)
+	if !status.Connected || !status.Mobile.SimReady || !actual.Verified {
+		return fmt.Errorf("%w: 期望 %s", ErrSIMOffline, expected.SIMID)
+	}
+	if actual.SIMID != expected.SIMID || actual.ICCID != expected.ICCID {
+		return fmt.Errorf("%w: 期望 %s，实际 %s", ErrSIMMismatch, expected.SIMID, actual.SIMID)
+	}
+	if !supportsSIMIdentityProtocol(status.Version) {
+		return fmt.Errorf("%w: 当前 %q，最低要求 %s", ErrSIMProtocolOutdated, status.Version, minimumSIMIdentityProtocolVersion)
+	}
+	return nil
+}
+
+// waitForExpectedSIMIdentity 用于退出飞行模式后的物理控制确认。只有重新读取到
+// 目标 ICCID 才返回成功；若模块里已经是另一张卡，则立即失败关闭。
+func (s *SerialService) waitForExpectedSIMIdentity(ctx context.Context, expected SIMIdentity) error {
+	waitCtx, cancel := context.WithTimeout(ctx, cellularReadyTimeout)
+	defer cancel()
+	ticker := time.NewTicker(cellularReadyPollInterval)
+	defer ticker.Stop()
+
+	for {
+		err := s.ensureSIMIdentity(expected)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, ErrSIMMismatch) || errors.Is(err, ErrSIMProtocolOutdated) {
+			return err
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("%w: 等待目标 %s 身份确认超时", ErrSIMOffline, expected.SIMID)
+		case <-ticker.C:
+			s.RequestCacheUpdate()
+		}
+	}
+}
+
+const (
+	smsSendResultTimeout    = 2 * time.Minute
+	smsSendResultRetryDelay = 5 * time.Second
+)
 
 func (s *SerialService) startSMSSendTimeout(msgID string) {
-	timer := time.AfterFunc(smsSendResultTimeout, func() {
+	s.scheduleSMSSendTimeout(msgID, smsSendResultTimeout)
+}
+
+func (s *SerialService) scheduleSMSSendTimeout(msgID string, delay time.Duration) {
+	timer := time.AfterFunc(delay, func() {
 		s.pendingSMSTimers.Delete(msgID)
-		ctx := context.Background()
-		if err := s.textMsgService.UpdateStatusById(ctx, msgID, models.MessageStatusFailed); err != nil {
-			s.logger.Error("短信发送结果超时，更新状态失败", zap.String("request_id", msgID), zap.Error(err))
-		}
-		s.updateScheduledTaskStatus(ctx, msgID, models.LastRunStatusFailed)
-		s.restoreManualFlymodeAfterResult(msgID)
-		s.logger.Warn("等待短信发送结果超时", zap.String("request_id", msgID), zap.String("device_id", s.deviceID))
+		s.handleSMSSendTimeout(msgID)
 	})
 	s.pendingSMSTimers.Store(msgID, timer)
+}
+
+func (s *SerialService) handleSMSSendTimeout(msgID string) {
+	ctx := context.Background()
+	updated, err := s.textMsgService.MarkSendResultTimeout(ctx, msgID)
+	if err != nil {
+		s.logger.Error("短信发送结果超时，更新状态失败", zap.String("request_id", msgID), zap.Error(err))
+		// 数据库瞬时故障不能让消息永久留在 sending。短延迟
+		// 重试期间保留手动飞行模式恢复令牌，直到结果真正落库。
+		s.scheduleSMSSendTimeout(msgID, smsSendResultRetryDelay)
+		return
+	}
+	if updated {
+		s.updateScheduledTaskStatus(ctx, msgID, models.LastRunStatusAmbiguous)
+	} else if err == nil {
+		// 超时回调可能晚于设备回执。若短信已是终态，利用这次
+		// CAS 未命中的机会补齐上一次未成功持久化的任务结果。
+		s.reconcileScheduledTaskStatus(ctx, msgID)
+	}
+	s.restoreManualFlymodeAfterResult(msgID)
+	if updated {
+		s.logger.Warn("等待短信发送结果超时", zap.String("request_id", msgID), zap.String("device_id", s.deviceID))
+	}
 }
 
 func (s *SerialService) stopSMSSendTimeout(msgID string) {
@@ -488,6 +688,12 @@ func (s *SerialService) GetStatus() (*StatusData, error) {
 
 	// 从缓存读取
 	if status, ok := s.deviceCache.Get(CacheKeyDeviceStatus); ok {
+		if !s.statusAccepting.Load() || status.statusEpoch != s.statusEpoch.Load() {
+			return &StatusData{
+				DeviceID: s.deviceID, DeviceName: s.deviceName,
+				PortName: portName, Connected: connected,
+			}, nil
+		}
 		// 缓存中的状态只读，返回副本供本次请求补充连接信息。
 		snapshot := *status
 		// 更新串口连接信息
@@ -516,10 +722,13 @@ func (s *SerialService) FlyMode() bool {
 	return s.flyMode.Load()
 }
 
-// SetFlymode 设置飞行模式
-// enabled: true 表示启用飞行模式，false 表示禁用飞行模式
-func (s *SerialService) SetFlymode(enabled bool) error {
-	if err := s.setFlymode(enabled, flymodeChangeManual, ""); err != nil {
+// SetFlymode 设置飞行模式。启用时必须绑定当前 verified SIM，避免换卡竞态下
+// 把另一张卡所在的模块置入飞行模式；退出后由上层再次验证目标 ICCID。
+func (s *SerialService) SetFlymode(expected SIMIdentity, enabled bool) error {
+	s.smsSendMu.Lock()
+	defer s.smsSendMu.Unlock()
+
+	if err := s.setFlymode(enabled, flymodeChangeManual, "", &expected); err != nil {
 		return err
 	}
 	// 公开方法代表用户或其他业务手动设置，不再视为自动逻辑持有。
@@ -531,32 +740,141 @@ func (s *SerialService) SetFlymode(enabled bool) error {
 	return nil
 }
 
-func (s *SerialService) setFlymode(enabled bool, source flymodeChangeSource, reason string) error {
+func (s *SerialService) setFlymode(
+	enabled bool,
+	source flymodeChangeSource,
+	reason string,
+	expected *SIMIdentity,
+) error {
+	if enabled {
+		if expected == nil || expected.SIMID == "" || expected.ICCID == "" {
+			return ErrSIMIdentityRequired
+		}
+		wantedAutomatic := source == flymodeChangeAutomatic
+		sameOwnerFlight := s.FlyMode() && s.FlymodeOwnerSIMID() == expected.SIMID
+		if sameOwnerFlight &&
+			s.autoFlymodeActive.Load() == wantedAutomatic {
+			return nil
+		}
+		if s.hasPendingSMS() {
+			return ErrSMSOperationPending
+		}
+		// 飞行模式中 ICCID 暂不可读；相同 owner 只是在 automatic/manual
+		// 之间转移策略所有权，由 Lua 对已保存 owner 再核对，不重复切换基带。
+		if !sameOwnerFlight {
+			if err := s.ensureSIMIdentity(*expected); err != nil {
+				return err
+			}
+		}
+	}
+	if !enabled && expected != nil && s.FlyMode() {
+		owner := s.FlymodeOwnerSIMID()
+		if owner != "" && owner != expected.SIMID {
+			return fmt.Errorf("%w: 期望 %s，飞行模式所有者 %s", ErrSIMMismatch, expected.SIMID, owner)
+		}
+	}
 	cmd := map[string]any{
 		"action":  "set_flymode",
 		"enabled": enabled,
+		"source":  source.protocolValue(),
 	}
-	if err := s.sendJSONCommand(cmd); err != nil {
+	if !enabled && source == flymodeChangeAutomatic && expected != nil &&
+		s.FlyMode() && !s.autoFlymodeActive.Load() {
+		// 从用户手动飞行模式临时唤醒发送短信。设备保留 owner 意图，
+		// 即使主机在结果返回前重启，也能在重新握手后恢复。
+		cmd["preserve_manual_owner"] = true
+	}
+	if expected != nil && expected.ICCID != "" {
+		cmd["expected_iccid"] = expected.ICCID
+	}
+	if err := s.sendControlCommand(cmd); err != nil {
+		// 设备明确表示短信仍在执行时，控制动作没有发生，当前身份代际仍然可信。
+		// 保留它才能让手动飞行模式恢复逻辑稍后安全重试。
+		if !errors.Is(err, ErrSMSOperationPending) {
+			s.invalidateDeviceStatus(true)
+			s.RequestCacheUpdate()
+		}
 		return err
 	}
 	// 更新飞行模式状态
 	s.flyMode.Store(enabled)
+	if enabled {
+		s.setFlymodeOwner(expected.SIMID)
+		s.autoFlymodeActive.Store(source == flymodeChangeAutomatic)
+	} else {
+		s.setFlymodeOwner("")
+		s.autoFlymodeActive.Store(false)
+	}
 	s.notifyFlymodeChanged(source, enabled, reason)
 	return nil
 }
 
-// RebootMcu 重启模块
-func (s *SerialService) RebootMcu() error {
-	cmd := map[string]string{"action": "reboot_mcu"}
+// RebootMcu 重启模块。按 SIM 调用时 expected 非空，并在主机和 Lua 两端复核；
+// 按 deviceId 的显式物理维护操作可传 nil。
+func (s *SerialService) RebootMcu(expected *SIMIdentity) error {
+	s.smsSendMu.Lock()
+	defer s.smsSendMu.Unlock()
+	if s.hasPendingSMS() {
+		return ErrSMSOperationPending
+	}
+	cmd := map[string]any{"action": "reboot_mcu"}
+	if expected != nil {
+		if err := s.ensureSIMIdentity(*expected); err != nil {
+			return err
+		}
+		cmd["expected_iccid"] = expected.ICCID
+	}
+	if err := s.sendControlCommand(cmd); err != nil {
+		if !errors.Is(err, ErrSMSOperationPending) {
+			s.invalidateDeviceStatus(true)
+			s.RequestCacheUpdate()
+		}
+		return err
+	}
+	// 从命令写出起禁止复用重启前的身份，等待 system_ready 或新连接。
+	s.invalidateDeviceStatus(false)
+	s.resetPhysicalConnectionState()
+	s.recordSMSActivity()
+	return nil
+}
+
+func (s *SerialService) sendControlCommand(cmd map[string]any) error {
+	requestID := uuid.NewString()
+	cmd["request_id"] = requestID
+	responseCh := make(chan controlCommandResponse, 1)
+	s.pendingControls.Store(requestID, responseCh)
+	defer s.pendingControls.Delete(requestID)
+
 	if err := s.sendJSONCommand(cmd); err != nil {
 		return err
 	}
-	// 重启后，飞行模式默认关闭
-	s.flyMode.Store(false)
-	s.autoFlymodeActive.Store(false)
-	s.manualFlymodeGen.Add(1)
-	s.recordSMSActivity()
-	return nil
+	timer := time.NewTimer(controlCommandResponseTimeout)
+	defer timer.Stop()
+
+	select {
+	case response := <-responseCh:
+		action, _ := cmd["action"].(string)
+		if response.Action != action {
+			return fmt.Errorf("%w: 响应动作 %q 与请求 %q 不一致", ErrControlCommandRejected, response.Action, action)
+		}
+		if response.Result == "ok" {
+			return nil
+		}
+		switch response.Error {
+		case "sim_identity_mismatch":
+			return fmt.Errorf("%w: %s", ErrSIMMismatch, response.Error)
+		case "sim_identity_unavailable":
+			return fmt.Errorf("%w: %s", ErrSIMOffline, response.Error)
+		case "expected_iccid_required":
+			return fmt.Errorf("%w: %s", ErrSIMIdentityRequired, response.Error)
+		case "sms_operation_pending":
+			return fmt.Errorf("%w: %s", ErrSMSOperationPending, response.Error)
+		default:
+			return fmt.Errorf("%w: %s", ErrControlCommandRejected, response.Error)
+		}
+	case <-timer.C:
+		return fmt.Errorf("%w: request_id=%s", ErrControlCommandTimeout, requestID)
+	}
 }
 
 // sendJSONCommand 发送JSON命令到设备
@@ -571,6 +889,9 @@ func (s *SerialService) sendJSONCommand(cmd any) error {
 	message, jsonData, err := buildCommandMessage(cmd)
 	if err != nil {
 		return err
+	}
+	if len(message) > MaxUARTCommandFrameBytes {
+		return fmt.Errorf("串口命令帧过大: %d > %d", len(message), MaxUARTCommandFrameBytes)
 	}
 
 	err = writeAll(s.port, message)
@@ -596,15 +917,39 @@ func (s *SerialService) closeSerial() {
 }
 
 func writeAll(writer io.Writer, data []byte) error {
+	written := 0
 	for len(data) > 0 {
 		n, err := writer.Write(data)
-		if err != nil {
-			return err
+		if n < 0 || n > len(data) {
+			return wrapWriteProgressError(written, io.ErrShortWrite)
 		}
-		if n <= 0 || n > len(data) {
-			return io.ErrShortWrite
-		}
+		written += n
 		data = data[n:]
+		if err != nil {
+			return wrapWriteProgressError(written, err)
+		}
+		if n == 0 {
+			return wrapWriteProgressError(written, io.ErrShortWrite)
+		}
 	}
 	return nil
+}
+
+type writeProgressError struct {
+	written int
+	err     error
+}
+
+func (e *writeProgressError) Error() string { return e.err.Error() }
+func (e *writeProgressError) Unwrap() error { return e.err }
+
+func wrapWriteProgressError(written int, err error) error {
+	return &writeProgressError{written: written, err: err}
+}
+
+func writeMayHaveReachedDevice(err error) bool {
+	var progressErr *writeProgressError
+	// 一旦调用底层 Write，驱动返回的 n/err 组合不足以证明设备没有收到
+	// 数据，因此统一按不确定处理；只有尚未调用 Write 的错误才可确定失败。
+	return errors.As(err, &progressErr)
 }

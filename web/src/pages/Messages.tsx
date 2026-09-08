@@ -3,7 +3,7 @@ import {Loader2, MoreVertical, Plus, RefreshCw, Search, Send, Trash2, User} from
 import {useSearchParams} from 'react-router-dom';
 import {toast} from 'sonner';
 import {clearMessages, getConversations, getConversationMessages, deleteConversation, deleteMessage} from '../api/messages';
-import {getStatus, sendSMS} from '../api/serial';
+import {sendSMS} from '../api/serial';
 import {Input} from '@/components/ui/input';
 import {Button} from '@/components/ui/button';
 import {Textarea} from '@/components/ui/textarea';
@@ -22,25 +22,191 @@ import {
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query';
-import type {Conversation, DeviceStatus, TextMessage} from '@/api/types';
+import type {Conversation, TextMessage} from '@/api/types';
 import {PageHeader} from '@/components/PageHeader';
-import {useDevice} from '@/providers/DeviceProvider';
+import {useSim} from '@/providers/SimContext';
+import {formatSimLabel, getErrorMessage, isAssignableSim} from '@/lib/sim';
+import {createRequestId, isDefinitiveAPIRejection} from '@/lib/request-id';
+
+interface SendSMSVariables {
+    simId: string;
+    to: string;
+    content: string;
+    requestId: string;
+    source: 'conversation' | 'compose';
+}
+
+interface DraftRequest {
+    fingerprint: string;
+    requestId: string;
+}
+
+interface ConversationDraft {
+    content: string;
+    request?: DraftRequest;
+}
+
+interface ComposeDraft {
+    recipient: string;
+    content: string;
+    request?: DraftRequest;
+}
+
+interface SMSDraftStore {
+    version: 1;
+    conversations: Record<string, ConversationDraft>;
+    compose: Record<string, ComposeDraft>;
+}
+
+const SMS_DRAFT_STORAGE_KEY = 'uart-sms-forwarder:sms-drafts:v1';
+
+function emptyDraftStore(): SMSDraftStore {
+    return {version: 1, conversations: {}, compose: {}};
+}
+
+function validDraftRequest(value: unknown): DraftRequest | undefined {
+    if (!value || typeof value !== 'object') return undefined;
+    const candidate = value as Partial<DraftRequest>;
+    if (typeof candidate.fingerprint !== 'string' || typeof candidate.requestId !== 'string') return undefined;
+    return {fingerprint: candidate.fingerprint, requestId: candidate.requestId};
+}
+
+function loadDraftStore(): SMSDraftStore {
+    if (typeof window === 'undefined') return emptyDraftStore();
+    try {
+        const raw = window.localStorage.getItem(SMS_DRAFT_STORAGE_KEY);
+        if (!raw) return emptyDraftStore();
+        const parsed = JSON.parse(raw) as Partial<SMSDraftStore>;
+        if (parsed.version !== 1) return emptyDraftStore();
+
+        const conversations: Record<string, ConversationDraft> = {};
+        if (parsed.conversations && typeof parsed.conversations === 'object') {
+            for (const [key, value] of Object.entries(parsed.conversations)) {
+                if (!value || typeof value !== 'object') continue;
+                const candidate = value as Partial<ConversationDraft>;
+                if (typeof candidate.content !== 'string') continue;
+                conversations[key] = {
+                    content: candidate.content,
+                    request: validDraftRequest(candidate.request),
+                };
+            }
+        }
+
+        const compose: Record<string, ComposeDraft> = {};
+        if (parsed.compose && typeof parsed.compose === 'object') {
+            for (const [key, value] of Object.entries(parsed.compose)) {
+                if (!value || typeof value !== 'object') continue;
+                const candidate = value as Partial<ComposeDraft>;
+                if (typeof candidate.recipient !== 'string' || typeof candidate.content !== 'string') continue;
+                compose[key] = {
+                    recipient: candidate.recipient,
+                    content: candidate.content,
+                    request: validDraftRequest(candidate.request),
+                };
+            }
+        }
+        return {version: 1, conversations, compose};
+    } catch {
+        return emptyDraftStore();
+    }
+}
+
+function saveDraftStore(store: SMSDraftStore): void {
+    if (typeof window === 'undefined') return;
+    try {
+        window.localStorage.setItem(SMS_DRAFT_STORAGE_KEY, JSON.stringify(store));
+    } catch {
+        // 隐私模式或存储配额不足时仍允许本次页面内发送。
+    }
+}
+
+function conversationDraftKey(simId: string, peer: string): string {
+    return JSON.stringify([simId, peer]);
+}
+
+function requestIdForDraft(current: DraftRequest | null, fingerprint: string): DraftRequest {
+    if (current?.fingerprint === fingerprint) return current;
+    return {fingerprint, requestId: createRequestId()};
+}
 
 export default function Messages() {
-    const {selectedDeviceId} = useDevice();
+    const {selectedSimId, selectedSim} = useSim();
     const queryClient = useQueryClient();
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const [searchParams, setSearchParams] = useSearchParams();
+    const [draftStore, setDraftStore] = useState<SMSDraftStore>(loadDraftStore);
+    const draftStoreRef = useRef(draftStore);
 
-    // 选中的联系人
-    const [selectedPeer, setSelectedPeer] = useState<string | null>(null);
-    // 输入框内容
-    const [inputText, setInputText] = useState('');
+    const updateDraftStore = (update: (current: SMSDraftStore) => SMSDraftStore) => {
+        const next = update(draftStoreRef.current);
+        draftStoreRef.current = next;
+        // 同步持久化，确保发起网络请求后即使立刻刷新页面也不会丢失 requestId。
+        saveDraftStore(next);
+        setDraftStore(next);
+    };
+
+    // 每张 SIM 独立保存当前联系人，切卡不会把另一张卡的会话上下文带过来。
+    const [selectedPeers, setSelectedPeers] = useState<Record<string, string>>({});
+    const selectedPeer = selectedSimId ? selectedPeers[selectedSimId] ?? null : null;
+    const setSelectedPeer = (peer: string | null, simId = selectedSimId) => {
+        if (!simId) return;
+        setSelectedPeers((current) => {
+            if (peer) return {...current, [simId]: peer};
+            if (!(simId in current)) return current;
+            const next = {...current};
+            delete next[simId];
+            return next;
+        });
+    };
+    const activeConversationDraftKey = selectedSimId && selectedPeer
+        ? conversationDraftKey(selectedSimId, selectedPeer)
+        : '';
+    const activeConversationDraft = activeConversationDraftKey
+        ? draftStore.conversations[activeConversationDraftKey]
+        : undefined;
+    const inputText = activeConversationDraft?.content ?? '';
+    const setInputText = (content: string) => {
+        if (!activeConversationDraftKey) return;
+        updateDraftStore((current) => {
+            const conversations = {...current.conversations};
+            if (!content) {
+                delete conversations[activeConversationDraftKey];
+            } else {
+                conversations[activeConversationDraftKey] = {content};
+            }
+            return {...current, conversations};
+        });
+    };
     // 搜索关键词
     const [searchQuery, setSearchQuery] = useState('');
     const [composeOpen, setComposeOpen] = useState(searchParams.get('compose') === '1');
-    const [newRecipient, setNewRecipient] = useState('');
-    const [newContent, setNewContent] = useState('');
+    const activeComposeDraft = selectedSimId ? draftStore.compose[selectedSimId] : undefined;
+    const newRecipient = activeComposeDraft?.recipient ?? '';
+    const newContent = activeComposeDraft?.content ?? '';
+    const updateComposeDraft = (patch: Partial<Pick<ComposeDraft, 'recipient' | 'content'>>) => {
+        if (!selectedSimId) return;
+        const simId = selectedSimId;
+        updateDraftStore((current) => {
+            const compose = {...current.compose};
+            const previous = current.compose[simId] ?? {recipient: '', content: ''};
+            const recipient = patch.recipient ?? previous.recipient;
+            const content = patch.content ?? previous.content;
+            if (!recipient && !content) {
+                delete compose[simId];
+            } else {
+                const fingerprint = JSON.stringify([simId, recipient.trim(), content.trim()]);
+                compose[simId] = {
+                    recipient,
+                    content,
+                    request: previous.request?.fingerprint === fingerprint ? previous.request : undefined,
+                };
+            }
+            return {...current, compose};
+        });
+    };
+
+    // 草稿及对应 requestId 按 SIM/会话持久化。页面刷新、切卡或切换联系人后，
+    // 对同一份未确认请求重试时仍使用原 ID，不会再次写入设备。
 
     // 根据手机号生成头像颜色
     const getAvatarColor = (phoneNumber: string) => {
@@ -61,94 +227,142 @@ export default function Messages() {
 
     // 使用新的会话列表 API
     const {data: conversations = [], isLoading, refetch} = useQuery<Conversation[]>({
-        queryKey: ['conversations', selectedDeviceId],
-        queryFn: () => getConversations(selectedDeviceId),
+        queryKey: ['conversations', selectedSimId],
+        queryFn: () => getConversations(selectedSimId),
+        enabled: Boolean(selectedSimId),
         refetchInterval: 5000, // 每 5 秒自动刷新
-    });
-
-    const {data: deviceStatus} = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus', selectedDeviceId],
-        queryFn: async () => getStatus(selectedDeviceId) as Promise<DeviceStatus>,
-        refetchInterval: 10000,
     });
 
     // 获取指定会话的所有消息
     const {data: currentMessages = []} = useQuery<TextMessage[]>({
-        queryKey: ['conversation-messages', selectedDeviceId, selectedPeer],
+        queryKey: ['conversation-messages', selectedSimId, selectedPeer],
         queryFn: () => {
             if (!selectedPeer) return Promise.resolve([]);
-            return getConversationMessages(selectedPeer, selectedDeviceId);
+            return getConversationMessages(selectedPeer, selectedSimId);
         },
-        enabled: !!selectedPeer,
+        enabled: Boolean(selectedSimId && selectedPeer),
         refetchInterval: 5000,
     });
 
     // 发送短信 Mutation
     const sendSMSMutation = useMutation({
-        mutationFn: (data: { to: string; content: string }) => sendSMS({...data, deviceId: selectedDeviceId}),
-        onSuccess: (_, variables) => {
-            setInputText('');
-            setNewRecipient('');
-            setNewContent('');
-            setComposeOpen(false);
-            setSelectedPeer(variables.to);
-            const nextParams = new URLSearchParams(searchParams);
-            nextParams.delete('compose');
-            setSearchParams(nextParams, {replace: true});
-            toast.success('短信已提交发送');
-            // 刷新会话列表和当前会话消息
-            queryClient.invalidateQueries({queryKey: ['conversations']});
-            queryClient.invalidateQueries({queryKey: ['conversation-messages']});
+		mutationFn: (variables: SendSMSVariables) => sendSMS({
+			simId: variables.simId,
+			to: variables.to,
+			content: variables.content,
+			requestId: variables.requestId,
+		}),
+		onSuccess: (result, variables) => {
+            // 请求携带点击发送时的 simId；发送途中切卡时不跳入另一张卡的同名会话。
+            setSelectedPeer(variables.to, variables.simId);
+			if (result.status === 'ambiguous') {
+                // 状态不确定时保留草稿和 requestId；如用户再次提交，
+                // 服务端只会回放原结果，不会再写一次 UART。
+                toast.warning(result.message);
+            } else {
+                if (variables.source === 'conversation') {
+                    const key = conversationDraftKey(variables.simId, variables.to);
+                    updateDraftStore((current) => {
+                        const draft = current.conversations[key];
+                        if (draft?.request?.requestId !== variables.requestId) return current;
+                        const conversations = {...current.conversations};
+                        delete conversations[key];
+                        return {...current, conversations};
+                    });
+                } else {
+                    updateDraftStore((current) => {
+                        const draft = current.compose[variables.simId];
+                        if (draft?.request?.requestId !== variables.requestId) return current;
+                        const compose = {...current.compose};
+                        delete compose[variables.simId];
+                        return {...current, compose};
+                    });
+                    setComposeOpen(false);
+                    const nextParams = new URLSearchParams(searchParams);
+                    nextParams.delete('compose');
+                    setSearchParams(nextParams, {replace: true});
+                }
+                toast.success('短信已提交发送');
+            }
+            queryClient.invalidateQueries({queryKey: ['conversations', variables.simId]});
+            queryClient.invalidateQueries({queryKey: ['conversation-messages', variables.simId, variables.to]});
         },
-        onError: (error) => {
+		onError: (error, variables) => {
             console.error('发送失败:', error);
-            toast.error('发送失败');
+			// 服务端明确拒绝表示本次没有进入不确定发送；下次点击使用新 ID。
+			// 网络错误则保留 ID，防止响应丢失后再次写入 UART。
+			if (isDefinitiveAPIRejection(error)) {
+				updateDraftStore((current) => {
+					if (variables.source === 'conversation') {
+						const key = conversationDraftKey(variables.simId, variables.to);
+						const draft = current.conversations[key];
+						if (draft?.request?.requestId !== variables.requestId) return current;
+						return {
+							...current,
+							conversations: {...current.conversations, [key]: {content: draft.content}},
+						};
+					}
+					const draft = current.compose[variables.simId];
+					if (draft?.request?.requestId !== variables.requestId) return current;
+					return {
+						...current,
+						compose: {
+							...current.compose,
+							[variables.simId]: {recipient: draft.recipient, content: draft.content},
+						},
+					};
+				});
+			}
+            toast.error(getErrorMessage(error, '发送失败'));
         },
     });
 
     // 清空所有短信
     const clearMutation = useMutation({
-        mutationFn: () => clearMessages(selectedDeviceId),
-        onSuccess: () => {
+        mutationFn: (simId: string) => clearMessages(simId),
+        onSuccess: (_, simId) => {
             toast.success('清空成功');
-            setSelectedPeer(null);
-            queryClient.invalidateQueries({queryKey: ['conversations']});
-            queryClient.invalidateQueries({queryKey: ['conversation-messages']});
+            setSelectedPeer(null, simId);
+            queryClient.invalidateQueries({queryKey: ['conversations', simId]});
+            queryClient.invalidateQueries({queryKey: ['conversation-messages', simId]});
         },
         onError: (error) => {
             console.error('清空失败:', error);
-            toast.error('清空失败');
+            toast.error(getErrorMessage(error, '清空失败'));
         },
     });
 
     // 删除整个会话
     const deleteConversationMutation = useMutation({
-        mutationFn: (peer: string) => deleteConversation(peer, selectedDeviceId),
-        onSuccess: (_, peer) => {
+        mutationFn: ({peer, simId}: {peer: string; simId: string}) => deleteConversation(peer, simId),
+        onSuccess: (_, {peer, simId}) => {
             toast.success('会话已删除');
             // 如果删除的是当前选中的会话，清除选中状态
-            if (selectedPeer === peer) {
-                setSelectedPeer(null);
-            }
-            queryClient.invalidateQueries({queryKey: ['conversations']});
+            setSelectedPeers((current) => {
+                if (current[simId] !== peer) return current;
+                const next = {...current};
+                delete next[simId];
+                return next;
+            });
+            queryClient.invalidateQueries({queryKey: ['conversations', simId]});
         },
         onError: (error) => {
             console.error('删除失败:', error);
-            toast.error('删除会话失败');
+            toast.error(getErrorMessage(error, '删除会话失败'));
         },
     });
 
     // 删除单条消息
     const deleteMessageMutation = useMutation({
-        mutationFn: (messageId: string) => deleteMessage(messageId),
-        onSuccess: () => {
+        mutationFn: ({messageId, simId}: {messageId: string; simId: string}) => deleteMessage(messageId, simId),
+        onSuccess: (_, {simId}) => {
             toast.success('消息已删除');
-            queryClient.invalidateQueries({queryKey: ['conversations']});
-            queryClient.invalidateQueries({queryKey: ['conversation-messages']});
+            queryClient.invalidateQueries({queryKey: ['conversations', simId]});
+            queryClient.invalidateQueries({queryKey: ['conversation-messages', simId]});
         },
         onError: (error) => {
             console.error('删除失败:', error);
-            toast.error('删除消息失败');
+            toast.error(getErrorMessage(error, '删除消息失败'));
         },
     });
 
@@ -172,7 +386,24 @@ export default function Messages() {
             toast.warning('请输入短信内容');
             return;
         }
-        sendSMSMutation.mutate({to: selectedPeer, content: inputText});
+        if (!selectedSimId || !canSend) {
+            toast.warning('当前 SIM 不可发送，请等待其上线并完成识别');
+            return;
+        }
+        const fingerprint = JSON.stringify([selectedSimId, selectedPeer, inputText]);
+        const key = conversationDraftKey(selectedSimId, selectedPeer);
+        const request = requestIdForDraft(draftStoreRef.current.conversations[key]?.request ?? null, fingerprint);
+        updateDraftStore((current) => ({
+            ...current,
+            conversations: {...current.conversations, [key]: {content: inputText, request}},
+        }));
+        sendSMSMutation.mutate({
+            simId: selectedSimId,
+            to: selectedPeer,
+            content: inputText,
+            requestId: request.requestId,
+            source: 'conversation',
+        });
     };
 
     const handleSendNewSMS = (event: React.FormEvent) => {
@@ -183,7 +414,23 @@ export default function Messages() {
             toast.warning('请输入目标手机号和短信内容');
             return;
         }
-        sendSMSMutation.mutate({to: recipient, content: message});
+        if (!selectedSimId || !canSend) {
+            toast.warning('当前 SIM 不可发送，请等待其上线并完成识别');
+            return;
+        }
+        const fingerprint = JSON.stringify([selectedSimId, recipient, message]);
+        const request = requestIdForDraft(draftStoreRef.current.compose[selectedSimId]?.request ?? null, fingerprint);
+        updateDraftStore((current) => ({
+            ...current,
+            compose: {...current.compose, [selectedSimId]: {recipient: newRecipient, content: newContent, request}},
+        }));
+        sendSMSMutation.mutate({
+            simId: selectedSimId,
+            to: recipient,
+            content: message,
+            requestId: request.requestId,
+            source: 'compose',
+        });
     };
 
     const handleComposeOpenChange = (open: boolean) => {
@@ -196,20 +443,23 @@ export default function Messages() {
     };
 
     const handleClear = () => {
-        if (!confirm('确定要清空所有短信吗？此操作不可恢复！')) return;
-        clearMutation.mutate();
+        if (!selectedSimId) return;
+        if (!confirm(`确定要清空 ${selectedSimLabel} 的所有短信吗？此操作不可恢复！`)) return;
+        clearMutation.mutate(selectedSimId);
     };
 
     const handleDeleteConversation = () => {
         if (!selectedPeer) return;
         if (!confirm(`确定要删除与 ${selectedPeer} 的所有消息吗？此操作不可恢复！`)) return;
-        deleteConversationMutation.mutate(selectedPeer);
+        if (!selectedSimId) return;
+        deleteConversationMutation.mutate({peer: selectedPeer, simId: selectedSimId});
     };
 
     const handleDeleteMessage = (messageId: string, e: React.MouseEvent) => {
         e.stopPropagation();
         if (!confirm('确定要删除这条消息吗？此操作不可恢复！')) return;
-        deleteMessageMutation.mutate(messageId);
+        if (!selectedSimId) return;
+        deleteMessageMutation.mutate({messageId, simId: selectedSimId});
     };
 
     const formatTime = (timestamp: number) => {
@@ -237,6 +487,8 @@ export default function Messages() {
                 return <span className="text-[10px] text-green-600">✓ 已发送</span>;
             case 'failed':
                 return <span className="text-[10px] text-red-600">✗ 失败</span>;
+            case 'ambiguous':
+                return <span className="text-[10px] font-medium text-amber-600" title="设备可能已经提交，请先核实，勿立即重试">⚠ 状态不确定</span>;
             case 'sending':
                 return <span className="text-[10px] text-gray-400">发送中...</span>;
             default:
@@ -244,9 +496,20 @@ export default function Messages() {
         }
     };
 
-    const connected = Boolean(deviceStatus?.connected);
+    const selectedSimLabel = formatSimLabel(selectedSim, selectedSimId);
+    const canSend = Boolean(
+        selectedSimId && selectedSim && isAssignableSim(selectedSim) && selectedSim.online &&
+        selectedSim.scriptCompatible && selectedSim.sendReady && !selectedSim.conflict,
+    );
+    const unavailableReason = selectedSim && !isAssignableSim(selectedSim)
+        ? '“未分配短信”仅供查看和管理，不能用于发送'
+        : selectedSim?.conflict
+        ? '当前 SIM 身份冲突，已禁止发送'
+        : selectedSim?.online && !selectedSim.scriptCompatible
+            ? '当前 Air780 脚本版本不兼容，请升级 main.lua'
+        : selectedSimId ? '当前 SIM 离线或尚未完成识别' : '请先选择 SIM';
 
-    if (isLoading) {
+    if (selectedSimId && isLoading) {
         return (
             <div className="flex min-h-[560px] h-[calc(100dvh-108px)] items-center justify-center">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
@@ -262,7 +525,9 @@ export default function Messages() {
                 description="查看短信会话、搜索历史记录，或向任意号码发送新短信。"
                 action={<div className="flex gap-2">
                     <Button
-                        onClick={() => setComposeOpen(true)}
+                        onClick={() => handleComposeOpenChange(true)}
+                        disabled={!canSend}
+                        title={canSend ? '新建短信' : unavailableReason}
                         size="sm"
                         className="bg-blue-600 text-white hover:bg-blue-700"
                     >
@@ -271,6 +536,7 @@ export default function Messages() {
                     </Button>
                     <Button
                         onClick={() => refetch()}
+                        disabled={!selectedSimId}
                         variant="outline"
                         size="sm"
                         className="hover:bg-gray-50"
@@ -288,6 +554,7 @@ export default function Messages() {
                         <DropdownMenuContent align="end">
                             <DropdownMenuItem
                                 onClick={handleClear}
+                                disabled={!selectedSimId || clearMutation.isPending}
                                 className="cursor-pointer text-rose-600 focus:bg-rose-50 focus:text-rose-700"
                             >
                                 <Trash2 className="mr-2 size-4"/>
@@ -324,7 +591,7 @@ export default function Messages() {
                         {filteredConversations.length === 0 ? (
                             <div className="flex flex-col items-center justify-center h-full text-gray-400">
                                 <User className="w-12 h-12 mb-2 opacity-30"/>
-                                <p className="text-sm">暂无会话</p>
+                                <p className="text-sm">{selectedSimId ? '暂无会话' : '请先选择 SIM'}</p>
                             </div>
                         ) : (
                             filteredConversations.map(conv => (
@@ -481,13 +748,13 @@ export default function Messages() {
                                 type="text"
                                 value={inputText}
                                 onChange={(e) => setInputText(e.target.value)}
-                                placeholder={!connected ? '设备未连接' : selectedPeer ? '输入消息内容...' : '请先选择联系人'}
-                                disabled={!connected || !selectedPeer || sendSMSMutation.isPending}
+                                placeholder={!canSend ? unavailableReason : selectedPeer ? '输入消息内容...' : '请先选择联系人'}
+                                disabled={!canSend || !selectedPeer || sendSMSMutation.isPending}
                                 className="flex-1 bg-gray-50 border-gray-200 focus:bg-white focus:border-blue-500 h-10"
                             />
                             <Button
                                 type="submit"
-                                disabled={!connected || !selectedPeer || !inputText.trim() || sendSMSMutation.isPending}
+                                disabled={!canSend || !selectedPeer || !inputText.trim() || sendSMSMutation.isPending}
                                 className="h-10 bg-[#0b2a55] px-6 text-white shadow-none hover:bg-slate-800"
                             >
                                 {sendSMSMutation.isPending ? (
@@ -520,7 +787,7 @@ export default function Messages() {
                                     id="new-sms-recipient"
                                     type="tel"
                                     value={newRecipient}
-                                    onChange={(event) => setNewRecipient(event.target.value)}
+                                    onChange={(event) => updateComposeDraft({recipient: event.target.value})}
                                     placeholder="请输入手机号"
                                     autoComplete="tel"
                                     disabled={sendSMSMutation.isPending}
@@ -535,15 +802,15 @@ export default function Messages() {
                                 <Textarea
                                     id="new-sms-content"
                                     value={newContent}
-                                    onChange={(event) => setNewContent(event.target.value)}
+                                    onChange={(event) => updateComposeDraft({content: event.target.value})}
                                     placeholder="请输入短信内容"
                                     className="min-h-32 resize-none"
                                     disabled={sendSMSMutation.isPending}
                                 />
                             </div>
-                            {!connected && (
+                            {!canSend && (
                                 <p className="rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-3 text-xs leading-5 text-rose-700">
-                                    当前设备未连接，连接串口设备后才能发送短信。
+                                    {unavailableReason}。历史短信仍可正常查看和管理。
                                 </p>
                             )}
                         </div>
@@ -554,7 +821,7 @@ export default function Messages() {
                             </Button>
                             <Button
                                 type="submit"
-                                disabled={!connected || !newRecipient.trim() || !newContent.trim() || sendSMSMutation.isPending}
+                                disabled={!canSend || !newRecipient.trim() || !newContent.trim() || sendSMSMutation.isPending}
                                 className="bg-blue-600 text-white hover:bg-blue-700"
                             >
                                 {sendSMSMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Send className="size-4"/>}

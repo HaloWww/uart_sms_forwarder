@@ -2,17 +2,24 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/dushixiang/uart_sms_forwarder/internal/models"
 	"github.com/dushixiang/uart_sms_forwarder/internal/repo"
-	"github.com/go-orz/orz"
 
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+)
+
+var (
+	ErrScheduledTaskSIMRequired = errors.New("计划任务必须指定 SIM")
+	ErrScheduledTaskBusy        = errors.New("计划任务正在执行或修改")
 )
 
 // SchedulerService 定时任务调度服务（包含任务管理功能）
@@ -21,6 +28,7 @@ type SchedulerService struct {
 	cron          *cron.Cron
 	repo          *repo.ScheduledTaskRepo
 	serialManager *SerialManager
+	taskLocks     sync.Map // map[taskID]*sync.Mutex；保留锁对象以保证同 ID 始终串行
 }
 
 // NewSchedulerService 创建定时任务服务实例
@@ -57,8 +65,31 @@ func (s *SchedulerService) GetById(ctx context.Context, id string) (*models.Sche
 	return &task, nil
 }
 
+func (s *SchedulerService) tryLockTask(id string) (*sync.Mutex, error) {
+	value, _ := s.taskLocks.LoadOrStore(id, &sync.Mutex{})
+	lock := value.(*sync.Mutex)
+	if !lock.TryLock() {
+		return nil, ErrScheduledTaskBusy
+	}
+	return lock, nil
+}
+
 // Create 创建定时任务
 func (s *SchedulerService) Create(ctx context.Context, task *models.ScheduledTask) error {
+	task.SIMID = strings.TrimSpace(task.SIMID)
+	if task.SIMID == "" || task.SIMID == UnassignedSIMID {
+		return ErrScheduledTaskSIMRequired
+	}
+	if err := ValidateSMSDestination(task.PhoneNumber); err != nil {
+		return err
+	}
+	if err := ValidateSMSContent(task.Content); err != nil {
+		return err
+	}
+	if err := s.serialManager.ValidateSIM(ctx, task.SIMID); err != nil {
+		return err
+	}
+	task.DeviceID = ""
 	now := time.Now().UnixMilli()
 	task.ID = uuid.New().String()
 	task.CreatedAt = now
@@ -68,39 +99,76 @@ func (s *SchedulerService) Create(ctx context.Context, task *models.ScheduledTas
 
 // Update 更新定时任务
 func (s *SchedulerService) Update(ctx context.Context, task *models.ScheduledTask) error {
+	lock, err := s.tryLockTask(task.ID)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
+
+	task.SIMID = strings.TrimSpace(task.SIMID)
+	if task.SIMID == "" || task.SIMID == UnassignedSIMID {
+		return ErrScheduledTaskSIMRequired
+	}
+	if err := ValidateSMSDestination(task.PhoneNumber); err != nil {
+		return err
+	}
+	if err := ValidateSMSContent(task.Content); err != nil {
+		return err
+	}
+	if err := s.serialManager.ValidateSIM(ctx, task.SIMID); err != nil {
+		return err
+	}
 	existingTask, err := s.GetById(ctx, task.ID)
 	if err != nil {
 		return err
 	}
 	existingTask.Name = task.Name
-	existingTask.DeviceID = task.DeviceID
+	existingTask.SIMID = task.SIMID
 	existingTask.Enabled = task.Enabled
 	existingTask.IntervalDays = task.IntervalDays
 	existingTask.PhoneNumber = task.PhoneNumber
 	existingTask.Content = task.Content
+	existingTask.UpdatedAt = time.Now().UnixMilli()
 
-	return s.repo.Save(ctx, existingTask)
+	if err := s.repo.UpdateDefinition(ctx, existingTask); err != nil {
+		return err
+	}
+	*task = *existingTask
+	return nil
 }
 
 // Delete 删除定时任务
 func (s *SchedulerService) Delete(ctx context.Context, id string) error {
+	lock, err := s.tryLockTask(id)
+	if err != nil {
+		return err
+	}
+	defer lock.Unlock()
 	return s.repo.DeleteById(ctx, id)
 }
 
 // TriggerTask 立即触发执行指定的任务
 func (s *SchedulerService) TriggerTask(ctx context.Context, id string) error {
-	// 获取任务
-	task, err := s.GetById(ctx, id)
+	_, err := s.TriggerTaskWithRequestID(ctx, id, uuid.NewString())
+	return err
+}
+
+// TriggerTaskWithRequestID 使用浏览器生成并持久化的 UUID 触发一次执行。
+// 浏览器响应丢失后重放同一 ID，只会读取第一次执行的状态。
+func (s *SchedulerService) TriggerTaskWithRequestID(
+	ctx context.Context,
+	id string,
+	requestID string,
+) (string, error) {
+	parsed, err := uuid.Parse(strings.TrimSpace(requestID))
 	if err != nil {
-		return fmt.Errorf("获取任务失败: %w", err)
+		return "", fmt.Errorf("%w: %s", ErrSMSRequestIDInvalid, requestID)
 	}
-
-	// 执行任务
-	if err := s.executeTask(*task); err != nil {
-		return fmt.Errorf("执行任务失败: %w", err)
+	messageID, err := s.executeTaskWithRequestID(id, false, parsed.String())
+	if err != nil {
+		return messageID, fmt.Errorf("执行任务失败: %w", err)
 	}
-
-	return nil
+	return messageID, nil
 }
 
 // ==================== 调度相关方法 ====================
@@ -147,7 +215,7 @@ func (s *SchedulerService) checkAndExecuteTasks() error {
 				zap.String("name", task.Name),
 				zap.Int("intervalDays", task.IntervalDays))
 
-			if err := s.executeTask(task); err != nil {
+			if err := s.executeTask(task.ID, true); err != nil {
 				s.logger.Error("执行定时任务失败",
 					zap.String("id", task.ID),
 					zap.String("name", task.Name),
@@ -179,42 +247,124 @@ func (s *SchedulerService) shouldExecuteTask(task models.ScheduledTask, now time
 	return daysSinceLastRun >= task.IntervalDays
 }
 
-// executeTask 执行任务
-func (s *SchedulerService) executeTask(task models.ScheduledTask) error {
+// executeTask 执行任务。定时扫描使用 scheduled=true，会在拿到任务锁后重新读取
+// 并再次判断 enabled/周期，防止使用扫描阶段的旧 SIM 绑定发送。
+func (s *SchedulerService) executeTask(taskID string, scheduled bool) error {
+	_, err := s.executeTaskWithRequestID(taskID, scheduled, "")
+	return err
+}
+
+func (s *SchedulerService) executeTaskWithRequestID(
+	taskID string,
+	scheduled bool,
+	requestID string,
+) (string, error) {
+	lock, err := s.tryLockTask(taskID)
+	if err != nil {
+		return "", err
+	}
+	defer lock.Unlock()
+
+	ctx := context.Background()
+	current, err := s.GetById(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	if requestID != "" {
+		messageID, known, replayErr := s.replayScheduledRequest(ctx, current.ID, requestID)
+		if known || replayErr != nil {
+			return messageID, replayErr
+		}
+	}
+	if scheduled && (!current.Enabled || !s.shouldExecuteTask(*current, time.Now())) {
+		return "", nil
+	}
+	task := *current
 	s.logger.Info("执行定时任务",
 		zap.String("id", task.ID),
 		zap.String("name", task.Name),
-		zap.String("phone", task.PhoneNumber),
-		zap.String("content", task.Content))
+		zap.String("sim_id", task.SIMID),
+		zap.Int("content_length", len(task.Content)))
 
-	ctx := context.Background()
+	task.SIMID = strings.TrimSpace(task.SIMID)
+	if task.SIMID == "" || task.SIMID == UnassignedSIMID {
+		s.logger.Error("计划任务没有可用的 SIM 身份，已阻止发送",
+			zap.String("id", task.ID), zap.String("legacy_device_id", task.DeviceID))
+		return "", ErrScheduledTaskSIMRequired
+	}
+
+	// 先持久化 task↔message 关联，再下发串口命令。设备即使立即回包，
+	// UpdateLastRunStatusByMsgId 也一定能命中本次任务。
+	msgID := requestID
+	if msgID == "" {
+		msgID = uuid.NewString()
+	}
+	if err := s.repo.ClaimExecution(ctx, task.ID, msgID, time.Now().UnixMilli(), scheduled); err != nil {
+		if errors.Is(err, repo.ErrScheduledTaskExecutionPending) {
+			return msgID, ErrScheduledTaskBusy
+		}
+		return msgID, fmt.Errorf("预登记计划任务执行失败: %w", err)
+	}
 
 	// SendSMS 会统一处理飞行模式唤醒、等待网络注册及原手动状态恢复。
-	msgId, err := s.serialManager.SendSMS(task.DeviceID, task.PhoneNumber, task.Content)
+	_, err = s.serialManager.sendScheduledSMSWithRequestID(
+		task.ID, task.SIMID, task.PhoneNumber, task.Content, msgID,
+	)
 	if err != nil {
 		s.logger.Error("定时任务发送短信失败",
 			zap.String("id", task.ID),
 			zap.String("name", task.Name),
 			zap.Error(err))
-		_ = s.UpdateLastRun(ctx, task.ID, msgId, models.LastRunStatusFailed)
-		return err
+		if errors.Is(err, ErrSMSSubmissionAmbiguous) {
+			// SerialService 已将消息与任务标记为 ambiguous；保留预登记，
+			// 设备若稍后回包仍可更新最终结果。
+			return msgID, err
+		}
+		// 未成功写出完整命令时恢复执行前状态；若回滚也失败，预登记的
+		// ambiguous 状态会保守地阻止快速自动重试。
+		if restoreErr := s.repo.RestoreExecution(ctx, task.ID, msgID, task); restoreErr != nil {
+			return msgID, fmt.Errorf("%w；回滚执行登记失败: %v", err, restoreErr)
+		}
+		return msgID, err
 	}
-	s.logger.Info("定时任务执行成功",
+	s.logger.Info("定时任务短信已提交，等待设备最终回执",
 		zap.String("id", task.ID),
-		zap.String("name", task.Name))
+		zap.String("name", task.Name),
+		zap.String("request_id", msgID))
 
-	// 更新任务的 LastRunAt 字段到数据库
-	_ = s.UpdateLastRun(ctx, task.ID, msgId, models.LastRunStatusSuccess)
-
-	return nil
+	return msgID, nil
 }
 
-func (s *SchedulerService) UpdateLastRun(ctx context.Context, id, msgId string, status models.LastRunStatus) error {
-	return s.repo.UpdateColumnsById(ctx, id, orz.Map{
-		"last_msg_id":     msgId,
-		"last_run_at":     time.Now().UnixMilli(),
-		"last_run_status": status,
-	})
+// replayScheduledRequest 依赖短信记录上的永久 task 归属，而不是任务当前的
+// LastMsgId。这样任务以后执行新一轮后，旧请求仍不会把 LastMsgId 回滚或重复发送。
+func (s *SchedulerService) replayScheduledRequest(
+	ctx context.Context,
+	taskID string,
+	requestID string,
+) (messageID string, known bool, err error) {
+	if s.serialManager == nil || s.serialManager.textMsgService == nil {
+		return "", false, nil
+	}
+	message, err := s.serialManager.textMsgService.Get(ctx, requestID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return requestID, true, err
+	}
+	if message.Type != models.MessageTypeOutgoing || message.ScheduledTaskID != taskID {
+		return requestID, true, fmt.Errorf("%w: %s", ErrSMSRequestConflict, requestID)
+	}
+	switch message.Status {
+	case models.MessageStatusSending, models.MessageStatusSent:
+		return message.ID, true, nil
+	case models.MessageStatusAmbiguous:
+		return message.ID, true, ErrSMSSubmissionAmbiguous
+	case models.MessageStatusFailed:
+		return message.ID, true, fmt.Errorf("%w: %s", ErrSMSRequestPreviouslyFailed, message.SendError)
+	default:
+		return message.ID, true, fmt.Errorf("%w: 非法短信状态 %q", ErrSMSRequestConflict, message.Status)
+	}
 }
 
 func (s *SchedulerService) UpdateLastRunStatusByMsgId(ctx context.Context, msgId string, status models.LastRunStatus) error {

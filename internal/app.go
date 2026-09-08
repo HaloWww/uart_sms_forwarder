@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -47,6 +48,18 @@ func setup(app *orz.App) error {
 		logger.Error("数据库迁移失败", zap.Error(err))
 		return err
 	}
+	if err := disableUnboundScheduledTasks(db); err != nil {
+		logger.Error("停用未绑定 SIM 的旧计划任务失败", zap.Error(err))
+		return err
+	}
+	if err := markInterruptedSendingMessages(db); err != nil {
+		logger.Error("恢复进程重启前未完成的短信状态失败", zap.Error(err))
+		return err
+	}
+	if err := reconcileScheduledTaskResults(db); err != nil {
+		logger.Error("对账计划任务与短信结果失败", zap.Error(err))
+		return err
+	}
 
 	// 2. 读取应用配置
 	var appConfig config.AppConfig
@@ -78,6 +91,7 @@ func setup(app *orz.App) error {
 	// 6. 初始化串口服务
 	serialManager, err := service.NewSerialManager(
 		logger,
+		db,
 		appConfig.Serial,
 		textMessageService,
 		notifier,
@@ -86,18 +100,8 @@ func setup(app *orz.App) error {
 	if err != nil {
 		return err
 	}
-	// 旧版数据没有设备字段，迁移到默认设备，保证升级后历史记录仍可见。
-	defaultDeviceID, defaultDeviceName := serialManager.DefaultDevice()
-	if err := db.Model(&models.TextMessage{}).
-		Where("device_id = '' OR device_id IS NULL").
-		Updates(map[string]any{"device_id": defaultDeviceID, "device_name": defaultDeviceName}).Error; err != nil {
-		return err
-	}
-	if err := db.Model(&models.ScheduledTask{}).
-		Where("device_id = '' OR device_id IS NULL").
-		Update("device_id", defaultDeviceID).Error; err != nil {
-		return err
-	}
+	// 旧数据缺少可验证的 ICCID，不能依据当前串口或当前插卡自动归属。
+	// 历史记录保留为未分配；旧计划任务必须由用户明确选择 SIM 后才能执行。
 
 	// 7. 初始化定时任务服务
 	schedulerService := service.NewSchedulerService(
@@ -163,7 +167,67 @@ func autoMigrate(db *gorm.DB) error {
 		&models.Property{},
 		&models.TextMessage{},
 		&models.ScheduledTask{},
+		&models.SIMProfile{},
 	)
+}
+
+// disableUnboundScheduledTasks 是幂等的安全迁移：旧任务没有可验证的 ICCID 时先停用，
+// 防止升级后根据当前插卡猜测目标。用户明确选择 SIM 后可重新启用。
+func disableUnboundScheduledTasks(db *gorm.DB) error {
+	return db.Model(&models.ScheduledTask{}).
+		Where("(sim_id = '' OR sim_id IS NULL) AND enabled = ?", true).
+		Update("enabled", false).Error
+}
+
+// markInterruptedSendingMessages 在启动时收口上次进程留下的 sending 记录。
+// 内存计时器和设备回执关联已丢失，不能宣称失败，否则人工重试可能重复发送。
+func markInterruptedSendingMessages(db *gorm.DB) error {
+	return db.Model(&models.TextMessage{}).
+		Where("type = ? AND status = ?", models.MessageTypeOutgoing, models.MessageStatusSending).
+		Updates(map[string]any{
+			"status": models.MessageStatusAmbiguous, "ambiguous": true,
+			"send_error": "process_restarted_before_result",
+		}).Error
+}
+
+// reconcileScheduledTaskResults 修复进程在“短信结果落库”和“任务状态更新”之间
+// 退出留下的不一致。Claim 后尚未创建短信就退出时，串口命令一定还未下发，
+// 因此可明确记为失败；已有终态短信则以短信事实为准。
+func reconcileScheduledTaskResults(db *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		var tasks []models.ScheduledTask
+		if err := tx.Where(
+			"last_run_status = ? AND COALESCE(last_msg_id, '') <> ''",
+			models.LastRunStatusAmbiguous,
+		).Find(&tasks).Error; err != nil {
+			return err
+		}
+		for _, task := range tasks {
+			var message models.TextMessage
+			err := tx.Where("id = ?", task.LastMsgId).First(&message).Error
+			status := models.LastRunStatusAmbiguous
+			switch {
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				status = models.LastRunStatusFailed
+			case err != nil:
+				return err
+			case message.Status == models.MessageStatusSent:
+				status = models.LastRunStatusSuccess
+			case message.Status == models.MessageStatusFailed:
+				status = models.LastRunStatusFailed
+			}
+			if status == models.LastRunStatusAmbiguous {
+				continue
+			}
+			if err := tx.Model(&models.ScheduledTask{}).
+				Where("id = ? AND last_msg_id = ? AND last_run_status = ?",
+					task.ID, task.LastMsgId, models.LastRunStatusAmbiguous).
+				Update("last_run_status", status).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // setupApi 设置API路由
@@ -222,6 +286,7 @@ func setupApi(app *orz.App, handlers *Handlers, appConfig *config.AppConfig, log
 	api.POST("/serial/sms", handlers.Serial.SendSMS)
 	api.GET("/serial/status", handlers.Serial.GetStatus) // 包含移动网络信息
 	api.GET("/serial/devices", handlers.Serial.GetDevices)
+	api.GET("/serial/sims", handlers.Serial.GetSIMs)
 	api.POST("/serial/flymode", handlers.Serial.SetFlymode)
 	api.POST("/serial/reboot", handlers.Serial.RebootMcu)
 

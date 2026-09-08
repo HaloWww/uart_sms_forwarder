@@ -11,28 +11,20 @@ import {
     saveAutoFlymodeConfig,
     type AutoFlymodeConfig,
 } from '@/api/property';
-import {getStatus} from '@/api/serial';
-import type {DeviceStatus} from '@/api/types';
 import {PageHeader} from '@/components/PageHeader';
-import {useDevice} from '@/providers/DeviceProvider';
+import {useSim} from '@/providers/SimContext';
 
 const MIN_IDLE_HOURS = 1;
 const MAX_IDLE_HOURS = 30 * 24;
 
 export default function AutoFlymodeSettings() {
-    const {selectedDeviceId} = useDevice();
+    const {selectedSim, isLoading: simsLoading} = useSim();
     const queryClient = useQueryClient();
     const [draft, setDraft] = useState<{enabled: boolean; idleTimeoutHours: string} | null>(null);
 
     const configQuery = useQuery({
         queryKey: ['autoFlymodeConfig'],
         queryFn: getAutoFlymodeConfig,
-    });
-
-    const statusQuery = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus', selectedDeviceId],
-        queryFn: async () => getStatus(selectedDeviceId) as Promise<DeviceStatus>,
-        refetchInterval: 10000,
     });
 
     const saveMutation = useMutation({
@@ -79,7 +71,8 @@ export default function AutoFlymodeSettings() {
         );
     }
 
-    const deviceStatus = statusQuery.data;
+    const simOnline = Boolean(selectedSim?.online && !selectedSim.conflict);
+    const deviceStatus = simOnline ? selectedSim?.currentStatus : undefined;
 
     return (
         <div className="space-y-6 animate-in fade-in duration-300">
@@ -156,31 +149,29 @@ export default function AutoFlymodeSettings() {
                         <CardHeader>
                             <CardTitle className="flex items-center gap-2 text-base">
                                 <Activity className="h-5 w-5 text-blue-600"/>
-                                当前设备状态
+                                当前 SIM 状态
                             </CardTitle>
                         </CardHeader>
                         <CardContent className="space-y-3">
                             <div className="flex items-center justify-between text-sm">
                                 <span className="text-gray-500">串口连接</span>
-                                <span className={statusQuery.isLoading
+                                <span className={simsLoading
                                     ? 'font-medium text-slate-400'
-                                    : statusQuery.isError
-                                        ? 'font-medium text-rose-600'
-                                        : deviceStatus?.connected ? 'font-medium text-green-600' : 'font-medium text-red-600'}>
-                                    {statusQuery.isLoading ? '读取中' : statusQuery.isError ? '获取失败' : deviceStatus?.connected ? '在线' : '离线'}
+                                    : simOnline ? 'font-medium text-green-600' : 'font-medium text-red-600'}>
+                                    {simsLoading ? '读取中' : selectedSim?.conflict ? '身份冲突' : simOnline ? '在线' : '离线'}
                                 </span>
                             </div>
                             <div className="flex items-center justify-between text-sm">
                                 <span className="text-gray-500">飞行模式</span>
-                                <span className={statusQuery.isLoading || statusQuery.isError
+                                <span className={simsLoading || !simOnline
                                     ? 'font-medium text-slate-400'
                                     : deviceStatus?.flymode ? 'font-medium text-amber-600' : 'font-medium text-green-600'}>
-                                    {statusQuery.isLoading || statusQuery.isError ? '—' : deviceStatus?.flymode ? '已开启' : '已关闭'}
+                                    {simsLoading || !simOnline ? '—' : deviceStatus?.flymode ? '已开启' : '已关闭'}
                                 </span>
                             </div>
-                            {!statusQuery.isLoading && !statusQuery.isError && !deviceStatus?.connected && (
+                            {!simsLoading && !simOnline && (
                                 <p className="rounded-md bg-gray-50 p-3 text-xs leading-5 text-gray-500">
-                                    配置仍可保存，设备重新连接后自动生效。
+                                    配置仍可保存，SIM 重新上线后自动生效。
                                 </p>
                             )}
                         </CardContent>

@@ -19,7 +19,8 @@ type SerialConfig struct {
 	Devices []SerialDeviceConfig `json:"Devices"` // 多设备配置；为空时自动创建 default 设备
 }
 
-// SerialDeviceConfig 描述一台 Air780。ID 会写入短信记录和计划任务，配置后不应随意修改。
+// SerialDeviceConfig 描述一条 Air780 物理连接。ID 只标识连接配置；
+// 短信和计划任务使用 ICCID 派生的 simId，不会因模块或串口变化而改变归属。
 type SerialDeviceConfig struct {
 	ID      string `json:"ID"`
 	Name    string `json:"Name"`

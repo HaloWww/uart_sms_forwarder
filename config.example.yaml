@@ -30,14 +30,14 @@ App:
 
   # 串口配置
   Serial:
-    # 多设备模式。ID 会写入短信记录和计划任务，投入使用后不要随意修改。
+    # 多设备模式。ID 只标识物理串口连接；短信和计划任务按自动读取的 ICCID 归属。
     Devices:
       - ID: "air780-1"
-        Name: "主卡"
+        Name: "Air780 一号"
         Port: "/dev/ttyUSB0"
         Enabled: true
       # - ID: "air780-2"
-      #   Name: "备用卡"
+      #   Name: "Air780 二号"
       #   Port: "/dev/ttyUSB1"
       #   Enabled: true
     # 兼容旧版：Devices 为空时使用 Port 创建 default 设备，留空则自动检测。

@@ -20,23 +20,23 @@
 - 来电通知
 - 支持钉钉、企业微信、飞书、自定义 webhook、邮箱通知
 - 计划任务发送短信
-- 同时管理多台 Air780，短信、状态和计划任务按设备隔离
+- 同时管理多台 Air780，短信、状态和计划任务按 SIM 卡（ICCID）隔离
 - 串口断线重连、接收 ACK/去重和发送结果超时保护
 
 ## 多设备配置
 
-每台 Air780 都需要烧录仓库中的 `main.lua`，然后在 `config.yaml` 中为每个 USB 串口配置稳定且唯一的设备 ID：
+每台 Air780 都需要烧录仓库中的新版 `main.lua`，然后在 `config.yaml` 中为每个 USB 串口配置唯一的物理连接 ID：
 
 ```yaml
 App:
   Serial:
     Devices:
       - ID: "air780-1"
-        Name: "主卡"
+        Name: "Air780 一号"
         Port: "/dev/ttyUSB0"
         Enabled: true
       - ID: "air780-2"
-        Name: "备用卡"
+        Name: "Air780 二号"
         Port: "/dev/ttyUSB1"
         Enabled: true
 ```
@@ -49,18 +49,35 @@ devices:
   - /dev/ttyUSB1:/dev/ttyUSB1
 ```
 
-Web 顶部可以切换当前设备。发送短信、查看状态、短信会话、飞行模式和计划任务都会使用当前选择；计划任务会固定保存目标 `deviceId`。
+`Devices[].ID` 只表示模块当前连接在哪个串口，不再决定短信归属。系统从模块读取 ICCID，并生成稳定的 `simId`；Web 顶部按 SIM 切换，短信历史和计划任务都会固定保存目标 `simId`。把两张卡在两台 Air780 之间互换后，业务数据和计划任务仍跟随原 SIM，不会跟着串口或模块走。
 
-建议所有设备同步烧录新版 `main.lua`。新版主机连接后会主动协商开启接收 ACK；与旧版主机或旧版 Lua 组合时会自动退回原有无 ACK 模式。
+身份字段的含义：
 
-未配置 `Devices` 时仍兼容旧版 `App.Serial.Port`，系统会创建 ID 为 `default` 的设备，并在升级时把旧短信和计划任务迁移到该设备。
+- **ICCID**：SIM 卡本身的固定编号，是短信和计划任务的业务主键。
+- **IMSI**：运营商订阅身份，只作为辅助信息，不作为固定主键。
+- **IMEI**：Air780 模块的硬件编号，只记录“这次由哪台模块处理”，不能代表 SIM 卡。
+
+发送时主机会把目标 ICCID 下发给 Lua。Lua 会在入队和真正调用短信发送接口前再次读取并核对 ICCID；换卡、身份未确认或同一 ICCID 冲突时都会拒绝发送。已发现的 SIM 档案会保存在数据库里，所以 SIM 离线后仍可查看历史和编辑计划任务，但不能发送。
+
+如果设备已把短信提交给基带、但最终回执时 SIM 身份发生变化或回执超时，记录会显示“状态不确定”。这类短信可能已经发出，系统不会把它当作普通失败快速重试，以免产生重复短信。
+
+为避开 Air780 长短信接口在超规格输入下可能卡住的问题，主机和 Lua 都会在提交前拒绝超过 2048 个 UTF-8 字节的短信；16 KiB 串口帧上限覆盖 JSON 转义后的完整命令，Lua 侧也会隔离发送接口异常，避免一条异常短信终止后续发送队列。
+
+所有设备必须同步烧录仓库中的 `main.lua` 1.3.0 或更高版本。旧脚本不会完整保存飞行模式来源或在设备端校验 ICCID，新版主机会将其标记为不可安全发送并拒绝发送请求。新版主机连接后也会主动协商开启接收 ACK。
+
+未配置 `Devices` 时仍兼容旧版 `App.Serial.Port`，系统会创建 ID 为 `default` 的物理连接。旧数据库中没有 ICCID 快照的短信，以及换卡瞬间无法可靠确认身份的新接收短信，都会保留在“未分配短信”中，不会根据当前碰巧插入的卡自动归属；旧计划任务需要手动选择目标 SIM 后才能重新启用。
+
+不同 Air780 型号、底板和固件对运行中热插拔 SIM 的检测能力不同。为了保证路由及时刷新，建议先断电换卡，再重新上电；如果确认当前硬件支持热插拔，也应等待 Web 中两张 SIM 都显示在新的模块上后再发送。
 
 主要 API：
 
-- `GET /api/serial/devices`：返回所有设备及状态
-- `GET /api/serial/status?deviceId=air780-1`：查询指定设备
-- `POST /api/serial/sms`：请求体增加可选的 `deviceId`
-- `POST /api/serial/flymode`、`POST /api/serial/reboot`：请求体支持 `deviceId`
+- `GET /api/serial/devices`：返回所有物理连接及其当前状态
+- `GET /api/serial/sims`：返回所有已知 SIM（包括离线 SIM）及当前承载模块
+- `GET /api/serial/status?simId=iccid:...`：查询指定 SIM 当前状态
+- `POST /api/serial/sms`：请求体必须携带 `simId` 和 UUID 形式的 `requestId`（也可用 `Idempotency-Key` 请求头）。重试同一请求必须复用同一 ID；同 ID 且 `simId`/`to`/`content` 相同时只返回原 `messageId`、不会再次发送，参数不同则返回 409
+- `POST /api/serial/flymode`：请求体必须携带 `simId`，运行时解析当前承载模块
+- `POST /api/serial/reboot`：可按 `simId` 重启当前承载模块，也保留 `deviceId` 物理控制方式
+- `POST /api/scheduled-tasks/:id/trigger`：请求体必须携带 UUID 形式的 `requestId`（也可用 `Idempotency-Key` 请求头）；浏览器响应丢失时必须复用原 ID，避免“立即执行”被重复下发
 
 ## 截图
 

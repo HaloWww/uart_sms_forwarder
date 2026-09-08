@@ -17,7 +17,8 @@ import {useQuery} from '@tanstack/react-query';
 import {toast} from 'sonner';
 import {getVersion} from '@/api/property.ts';
 import {cn} from '@/lib/utils.ts';
-import {useDevice} from '@/providers/DeviceProvider';
+import {useSim} from '@/providers/SimContext';
+import {formatSimLabel, isAssignableSim, simAvailabilitySuffix, simIdentityTail} from '@/lib/sim';
 
 const navigation = [
     {name: '概览', description: '运行状态与数据', href: '/', icon: LayoutDashboard},
@@ -32,7 +33,24 @@ export default function Layout() {
     const location = useLocation();
     const navigate = useNavigate();
     const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-    const {devices, selectedDeviceId, setSelectedDeviceId, selectedDevice: deviceStatus} = useDevice();
+    const {sims, selectedSimId, setSelectedSimId, selectedSim} = useSim();
+    const deviceStatus = selectedSim?.currentStatus;
+    const simOnline = Boolean(selectedSim?.online && !selectedSim.conflict);
+    const simOperational = Boolean(simOnline && selectedSim?.scriptCompatible && selectedSim?.sendReady);
+    const selectedSimMissing = Boolean(selectedSimId && !selectedSim);
+    const simStateText = !selectedSimId
+        ? '尚未选择 SIM'
+        : selectedSimMissing
+            ? 'SIM 当前不可见'
+            : selectedSim && !isAssignableSim(selectedSim)
+                ? '未分配短信归档'
+            : selectedSim?.conflict
+                ? 'SIM 身份冲突'
+                : !selectedSim?.online
+                    ? 'SIM 当前离线'
+                    : !selectedSim.scriptCompatible
+                        ? '请升级 Air780 main.lua'
+                        : !selectedSim.sendReady ? '正在确认多设备 SIM 身份' : 'SIM 已上线';
 
     const versionQuery = useQuery({
         queryKey: ['version'],
@@ -122,20 +140,20 @@ export default function Layout() {
                         <div className="flex items-center gap-2">
                             <span className={cn(
                                 'relative flex size-2.5 rounded-full',
-                                deviceStatus?.connected ? 'bg-emerald-400' : 'bg-rose-400',
+                                simOperational ? 'bg-emerald-400' : 'bg-rose-400',
                             )}>
-                                {deviceStatus?.connected && <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400 opacity-50"/>}
+                                {simOperational && <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400 opacity-50"/>}
                             </span>
                             <div>
                                 <p className="text-[11px] font-semibold text-slate-100">
-                                    {deviceStatus?.connected ? '设备运行中' : '设备未连接'}
+                                    {simStateText}
                                 </p>
                                 <p className="mt-0.5 max-w-[130px] truncate font-mono text-[9px] text-blue-100/60">
-                                    {deviceStatus?.port_name || '等待串口连接'}
+                                    {simOnline ? deviceStatus?.port_name || '串口已连接' : '等待 SIM 上线'}
                                 </p>
                             </div>
                         </div>
-                        <RadioTower className={cn('size-4', deviceStatus?.connected ? 'text-blue-300' : 'text-blue-200/25')}/>
+                        <RadioTower className={cn('size-4', simOperational ? 'text-blue-300' : 'text-blue-200/25')}/>
                     </div>
                 </div>
                 <div className="flex items-center justify-between px-1">
@@ -186,28 +204,42 @@ export default function Layout() {
                             <span className="text-slate-700">{activeItem.name}</span>
                         </div>
                         <div className="ml-auto flex items-center gap-3">
-                            {devices.length > 0 && (
+                            {(sims.length > 0 || selectedSimId) && (
                                 <select
-                                    aria-label="当前 Air780 设备"
-                                    value={selectedDeviceId}
-                                    onChange={(event) => setSelectedDeviceId(event.target.value)}
+                                    aria-label="当前 SIM 卡"
+                                    value={selectedSimId}
+                                    onChange={(event) => setSelectedSimId(event.target.value)}
                                     className="h-8 max-w-44 rounded-lg border border-slate-200 bg-white px-2 text-xs font-semibold text-slate-700 outline-none focus:border-blue-400"
                                 >
-                                    {devices.map((device) => (
-                                        <option key={device.device_id} value={device.device_id}>
-                                            {device.device_name || device.device_id}{device.connected ? '' : '（离线）'}
+                                    {!selectedSimId && <option value="">请选择 SIM</option>}
+                                    {selectedSimMissing && (
+                                        <option value={selectedSimId}>
+                                            {`SIM •${simIdentityTail(selectedSimId) || '未知'}（当前不可见）`}
+                                        </option>
+                                    )}
+                                    {sims.map((sim) => (
+                                        <option key={sim.simId} value={sim.simId}>
+                                            {formatSimLabel(sim)}{simAvailabilitySuffix(sim)}
                                         </option>
                                     ))}
                                 </select>
                             )}
                             <div className={cn(
                                 'hidden items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold sm:flex',
-                                deviceStatus?.connected
+                                simOperational
                                     ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
                                     : 'border-rose-200 bg-rose-50 text-rose-700',
                             )}>
-                                <span className={cn('size-1.5 rounded-full', deviceStatus?.connected ? 'bg-emerald-500' : 'bg-rose-500')}/>
-                                {deviceStatus?.connected ? '链路正常' : '链路中断'}
+                                <span className={cn('size-1.5 rounded-full', simOperational ? 'bg-emerald-500' : 'bg-rose-500')}/>
+                                {simOperational
+                                    ? 'SIM 可用'
+                                    : selectedSim && !isAssignableSim(selectedSim)
+                                        ? '仅历史'
+                                        : selectedSim?.conflict
+                                            ? '身份冲突'
+                                            : selectedSim?.online && !selectedSim.scriptCompatible
+                                                ? '脚本需升级'
+                                                : selectedSim?.online ? '身份确认中' : 'SIM 离线'}
                             </div>
                             <div className="flex size-8 items-center justify-center rounded-full bg-[#0b2a55] text-[11px] font-bold text-white">
                                 {(localStorage.getItem('username') || 'U').slice(0, 1).toUpperCase()}

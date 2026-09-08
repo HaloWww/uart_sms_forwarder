@@ -1,14 +1,12 @@
-import {useEffect, useState} from 'react';
 import {Link} from 'react-router-dom';
 import {Cable, Clock3, MessageSquareText, Radio, RefreshCw, Send, Signal, Smartphone} from 'lucide-react';
 import {useQuery} from '@tanstack/react-query';
 import {getStats} from '../api/messages';
 import type {DeviceStatus, Stats} from '../api/types';
 import {StatCard} from '@/components/StatsCard.tsx';
-import {getStatus} from '@/api/serial.ts';
 import {cn} from '@/lib/utils.ts';
 import {PageHeader} from '@/components/PageHeader';
-import {useDevice} from '@/providers/DeviceProvider';
+import {useSim} from '@/providers/SimContext';
 
 const describeSignal = (rsrp?: number) => {
     if (!rsrp) return '等待数据';
@@ -20,34 +18,22 @@ const describeSignal = (rsrp?: number) => {
 };
 
 export default function Dashboard() {
-    const {selectedDeviceId} = useDevice();
-    const [stats, setStats] = useState<Stats | null>(null);
-    const [statsLoading, setStatsLoading] = useState(true);
-
-    useEffect(() => {
-        const loadStats = async () => {
-            try {
-                setStats(await getStats(selectedDeviceId));
-            } catch (error) {
-                console.error('获取统计信息失败:', error);
-            } finally {
-                setStatsLoading(false);
-            }
-        };
-
-        loadStats();
-        const interval = window.setInterval(loadStats, 30000);
-        return () => window.clearInterval(interval);
-    }, [selectedDeviceId]);
-
-    const {data: deviceStatus, dataUpdatedAt, isFetching} = useQuery<DeviceStatus>({
-        queryKey: ['deviceStatus', selectedDeviceId],
-        queryFn: async () => getStatus(selectedDeviceId) as Promise<DeviceStatus>,
-        refetchInterval: 10000,
+    const {selectedSimId, selectedSim, dataUpdatedAt, isFetching} = useSim();
+    const {data: stats, isLoading: statsLoading} = useQuery<Stats>({
+        queryKey: ['messageStats', selectedSimId],
+        queryFn: () => getStats(selectedSimId),
+        enabled: Boolean(selectedSimId),
+        refetchInterval: 30000,
     });
+    const deviceStatus: DeviceStatus | undefined = selectedSim?.online && !selectedSim.conflict
+        ? selectedSim.currentStatus
+        : undefined;
 
     const mobile = deviceStatus?.mobile;
     const connected = Boolean(deviceStatus?.connected);
+    const canSend = Boolean(
+        selectedSim?.online && selectedSim.scriptCompatible && selectedSim.sendReady && !selectedSim.conflict,
+    );
     const signalPercentage = connected && mobile?.rsrp
         ? Math.max(0, Math.min(100, Math.round(((mobile.rsrp + 140) / 96) * 100)))
         : 0;
@@ -63,7 +49,7 @@ export default function Dashboard() {
         {label: '运行内存', value: connected && deviceStatus?.mem_kb ? `${deviceStatus.mem_kb.toFixed(1)} KB` : unavailable},
     ];
 
-    if (statsLoading) {
+    if (selectedSimId && statsLoading) {
         return (
             <div className="grid min-h-[55vh] place-items-center">
                 <div className="flex items-center gap-3 rounded-xl border border-blue-100 bg-blue-50 px-5 py-3 text-sm font-medium text-blue-700">
@@ -83,11 +69,23 @@ export default function Dashboard() {
                     <span className="mr-1 hidden text-xs text-slate-400 md:inline">
                         {isFetching ? '正在同步' : `更新于 ${dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'}) : '—'}`}
                     </span>
-                    <Link to="/messages?compose=1" className="inline-flex h-9 items-center gap-2 rounded-lg bg-blue-600 px-3.5 text-xs font-semibold text-white transition-colors hover:bg-blue-700">
-                        <Send className="size-4"/>发送短信
-                    </Link>
+                    {canSend ? (
+                        <Link to="/messages?compose=1" className="inline-flex h-9 items-center gap-2 rounded-lg bg-blue-600 px-3.5 text-xs font-semibold text-white transition-colors hover:bg-blue-700">
+                            <Send className="size-4"/>发送短信
+                        </Link>
+                    ) : (
+                        <button type="button" disabled title="SIM 上线、脚本兼容且身份确认后才能发送" className="inline-flex h-9 cursor-not-allowed items-center gap-2 rounded-lg bg-slate-200 px-3.5 text-xs font-semibold text-slate-500">
+                            <Send className="size-4"/>发送短信
+                        </button>
+                    )}
                 </div>}
             />
+
+            {selectedSim?.online && !selectedSim.scriptCompatible && (
+                <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                    当前 Air780 的脚本版本不兼容，请升级设备上的 main.lua；升级前短信发送已禁用。
+                </div>
+            )}
 
             <section className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <StatCard
@@ -95,7 +93,9 @@ export default function Dashboard() {
                     value={connected ? '在线' : '离线'}
                     icon={Cable}
                     colorClass={connected ? 'bg-blue-50 text-blue-700' : 'bg-rose-50 text-rose-600'}
-                    subValue={connected ? deviceStatus?.port_name || '串口已连接' : '等待串口连接'}
+                    subValue={connected
+                        ? selectedSim?.scriptCompatible ? deviceStatus?.port_name || '串口已连接' : '请升级 main.lua'
+                        : '等待串口连接'}
                 />
                 <StatCard
                     label="信号质量"
@@ -204,7 +204,7 @@ export default function Dashboard() {
                     </div>
                     <div className="mt-4 divide-y divide-slate-100">
                         {[
-                            ['短信监听服务', connected],
+                            ['短信监听服务', Boolean(connected && selectedSim?.scriptCompatible)],
                             ['移动网络注册', Boolean(connected && mobile?.is_registered)],
                             ['SIM 卡状态', Boolean(connected && mobile?.sim_ready)],
                         ].map(([label, healthy]) => (

@@ -2,15 +2,15 @@ import type {ReactNode} from 'react';
 import {Activity, Loader2, MessageSquareText, RotateCcw, Signal} from 'lucide-react';
 import {Link} from 'react-router-dom';
 import {toast} from 'sonner';
-import {useMutation, useQuery} from '@tanstack/react-query';
+import {useMutation, useQueryClient} from '@tanstack/react-query';
 import * as serialApi from '../api/serial';
 import {Button} from '@/components/ui/button';
 import {Card, CardContent, CardHeader, CardTitle} from '@/components/ui/card';
-import type {DeviceStatus} from '@/api/types';
 import {formatUptime} from '@/utils/utils.ts';
 import {PageHeader} from '@/components/PageHeader';
 import {cn} from '@/lib/utils';
-import {useDevice} from '@/providers/DeviceProvider';
+import {useSim} from '@/providers/SimContext';
+import {getErrorMessage, isAssignableSim} from '@/lib/sim';
 
 interface InfoRowProps {
     label: string;
@@ -52,47 +52,45 @@ function StatusTile({label, value, tone = 'slate'}: StatusTileProps) {
 }
 
 export default function SerialControl() {
-    const {selectedDeviceId} = useDevice();
-    const {
-        data: deviceStatus,
-        isFetching,
-        isLoading,
-        refetch: refetchStatus,
-    } = useQuery({
-        queryKey: ['deviceStatus', selectedDeviceId],
-        queryFn: async () => {
-            const res = await serialApi.getStatus(selectedDeviceId);
-            return res as DeviceStatus;
-        },
-        refetchInterval: 10000,
-    });
+    const {selectedSimId, selectedSim, isFetching, isLoading} = useSim();
+    const queryClient = useQueryClient();
+    const deviceStatus = selectedSim?.online && !selectedSim.conflict
+        ? selectedSim.currentStatus
+        : undefined;
 
     const setFlymodeMutation = useMutation({
-        mutationFn: (enabled: boolean) => serialApi.setFlymode(enabled, selectedDeviceId),
-        onSuccess: () => {
+        mutationFn: ({enabled, simId}: {enabled: boolean; simId: string}) => serialApi.setFlymode(enabled, simId),
+        onSuccess: async () => {
             toast.success('设置成功');
-            refetchStatus();
+            await queryClient.invalidateQueries({queryKey: ['sims']});
         },
         onError: (error) => {
             console.error('操作失败:', error);
-            toast.error('操作失败');
+            toast.error(getErrorMessage(error, '操作失败'));
         },
     });
 
     const rebootMcuMutation = useMutation({
-        mutationFn: () => serialApi.rebootMcu(selectedDeviceId),
-        onSuccess: () => {
+        mutationFn: (simId: string) => serialApi.rebootMcu(simId),
+        onSuccess: async () => {
             toast.success('模块重启命令已发送');
-            refetchStatus();
+            await queryClient.invalidateQueries({queryKey: ['sims']});
         },
         onError: (error) => {
             console.error('操作失败:', error);
-            toast.error('操作失败');
+            toast.error(getErrorMessage(error, '操作失败'));
         },
     });
 
     const mobile = deviceStatus?.mobile;
-    const connected = Boolean(deviceStatus?.connected);
+    const connected = Boolean(selectedSim?.online && !selectedSim.conflict && deviceStatus?.connected);
+    const controlReady = Boolean(
+        connected && selectedSim && isAssignableSim(selectedSim) && selectedSimId &&
+        selectedSim.scriptCompatible && selectedSim.sendReady,
+    );
+    const rebootReady = Boolean(
+        controlReady && deviceStatus?.identity_valid && deviceStatus.sim_id === selectedSimId,
+    );
     const unavailable = '—';
     const displaySignal = (value?: number, unit = '') => connected && value ? `${value}${unit}` : unavailable;
     const registrationText = !connected
@@ -114,6 +112,12 @@ export default function SerialControl() {
                 title="串口控制"
                 description="查看移动网络与模块状态，或执行设备控制命令。"
             />
+
+            {selectedSim?.online && !selectedSim.scriptCompatible && (
+                <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                    当前 Air780 的 main.lua 版本过旧。请升级脚本后再使用短信发送功能。
+                </div>
+            )}
 
             <div className="mt-6 grid items-start gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.65fr)]">
                 <Card className="gap-0 overflow-hidden py-0">
@@ -189,13 +193,28 @@ export default function SerialControl() {
                                 <section className="mt-5 border-t border-slate-100 pt-4">
                                     <h3 className="mb-1 text-xs font-bold text-slate-800">模块信息</h3>
                                     <dl className="grid gap-x-8 sm:grid-cols-2">
-                                        <InfoRow label="串口设备" value={connected ? deviceStatus?.port_name || unavailable : unavailable} mono/>
+                                        <InfoRow
+                                            label="串口设备"
+                                            value={connected
+                                                ? deviceStatus?.port_name || unavailable
+                                                : selectedSim?.lastPort ? `${selectedSim.lastPort}（上次）` : unavailable}
+                                            mono
+                                        />
+                                        <InfoRow
+                                            label="Air780 IMEI"
+                                            value={connected
+                                                ? deviceStatus?.imei || mobile?.imei || unavailable
+                                                : selectedSim?.lastImei ? `${selectedSim.lastImei}（上次）` : unavailable}
+                                            mono
+                                        />
                                         <InfoRow label="固件版本" value={connected ? deviceStatus?.version || unavailable : unavailable} mono/>
                                         <InfoRow
-                                            label="设备时间"
+                                            label={connected ? '设备时间' : '最后识别'}
                                             value={connected && deviceStatus?.timestamp
                                                 ? new Date(deviceStatus.timestamp * 1000).toLocaleString('zh-CN')
-                                                : unavailable}
+                                                : selectedSim?.lastSeenAt
+                                                    ? new Date(selectedSim.lastSeenAt).toLocaleString('zh-CN')
+                                                    : unavailable}
                                         />
                                         <InfoRow
                                             label="开机时长"
@@ -214,8 +233,8 @@ export default function SerialControl() {
 
                                     <div className="mt-3 grid gap-2 sm:grid-cols-2">
                                         {[
-                                            ['ICCID', connected ? mobile?.iccid || unavailable : unavailable],
-                                            ['IMSI', connected ? mobile?.imsi || unavailable : unavailable],
+                                            ['ICCID', mobile?.iccid || selectedSim?.iccid || unavailable],
+                                            ['IMSI', mobile?.imsi || selectedSim?.imsi || unavailable],
                                         ].map(([label, value]) => (
                                             <div key={label} className="min-w-0 rounded-lg bg-slate-50 px-3.5 py-3">
                                                 <p className="text-[10px] font-semibold text-slate-400">{label}</p>
@@ -250,16 +269,20 @@ export default function SerialControl() {
                         </dl>
                         <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
                             <Button
-                                onClick={() => setFlymodeMutation.mutate(!deviceStatus?.flymode)}
-                                disabled={!connected || setFlymodeMutation.isPending || isFetching}
+                                onClick={() => selectedSimId && setFlymodeMutation.mutate({
+                                    enabled: !deviceStatus?.flymode,
+                                    simId: selectedSimId,
+                                })}
+                                disabled={!controlReady || setFlymodeMutation.isPending || isFetching}
                                 className="h-10 bg-blue-600 text-white hover:bg-blue-700"
                             >
                                 {setFlymodeMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Signal className="size-4"/>}
                                 {deviceStatus?.flymode ? '关闭飞行模式' : '开启飞行模式'}
                             </Button>
                             <Button
-                                onClick={() => rebootMcuMutation.mutate()}
-                                disabled={!connected || rebootMcuMutation.isPending || isFetching}
+                                onClick={() => selectedSimId && rebootMcuMutation.mutate(selectedSimId)}
+                                disabled={!rebootReady || rebootMcuMutation.isPending || isFetching}
+                                title={rebootReady ? '重启当前承载模块' : '飞行模式或身份未确认时不能按 SIM 重启模块'}
                                 variant="outline"
                                 className="h-10 border-rose-200 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
                             >
@@ -267,7 +290,13 @@ export default function SerialControl() {
                                 重启模块
                             </Button>
                         </div>
-                        {!connected && <p className="mt-3 text-xs leading-5 text-slate-400">设备连接后才能执行控制操作。</p>}
+                        {!controlReady && <p className="mt-3 text-xs leading-5 text-slate-400">
+                            {selectedSim && !isAssignableSim(selectedSim)
+                                ? '该条目仅用于查看和管理旧数据或身份未确认的接收短信。'
+                                : selectedSim?.conflict
+                                ? '检测到 SIM 身份冲突，控制操作已禁用。'
+                                : 'SIM 上线并完成身份识别后才能执行控制操作。'}
+                        </p>}
 
                         <div className="mt-5 border-t border-slate-100 pt-4">
                             <p className="mb-3 text-xs leading-5 text-slate-500">发送和回复短信已统一移动到短信中心。</p>
