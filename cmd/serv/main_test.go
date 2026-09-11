@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,5 +44,41 @@ func TestPrepareConfigPathRejectsMissingFile(t *testing.T) {
 	_, err := prepareConfigPath([]string{"-config", filepath.Join(t.TempDir(), "missing.yaml")})
 	if err == nil {
 		t.Fatal("expected a missing config error")
+	}
+}
+
+func TestParseCommandOptionsInstallService(t *testing.T) {
+	options, err := parseCommandOptions([]string{"-install-service", "-config", "/opt/uart sms/config.yaml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !options.installService {
+		t.Fatal("install-service was not parsed")
+	}
+	if options.configPath != "/opt/uart sms/config.yaml" {
+		t.Fatalf("config path = %q", options.configPath)
+	}
+}
+
+func TestBuildSystemdUnit(t *testing.T) {
+	unit, err := buildSystemdUnit(`/opt/uart sms/uart_sms_forwarder`, `/opt/uart sms/config.yaml`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`WorkingDirectory="/opt/uart sms"`,
+		`ExecStart="/opt/uart sms/uart_sms_forwarder" -config "/opt/uart sms/config.yaml"`,
+		`Restart=always`,
+		`WantedBy=multi-user.target`,
+	} {
+		if !strings.Contains(unit, expected) {
+			t.Errorf("unit does not contain %q:\n%s", expected, unit)
+		}
+	}
+}
+
+func TestBuildSystemdUnitRejectsNewline(t *testing.T) {
+	if _, err := buildSystemdUnit("/opt/app\ninvalid", "/opt/config.yaml"); err == nil {
+		t.Fatal("expected newline path to be rejected")
 	}
 }

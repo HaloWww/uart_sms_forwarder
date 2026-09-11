@@ -15,7 +15,7 @@ build-web:
 build-server:
 	@echo "Building server for Linux amd64..."
 	@mkdir -p bin
-	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-amd64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-amd64 ./cmd/serv
 	upx bin/uart_sms_forwarder-linux-amd64
 	@echo "Server built successfully!"
 	@ls -lh bin/
@@ -27,31 +27,31 @@ build-servers:
 
 	# Linux
 	@echo "Building for Linux amd64..."
-	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-amd64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-amd64 ./cmd/serv
 
 	@echo "Building for Linux arm64..."
-	$(GOFLAGS) GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-arm64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-arm64 ./cmd/serv
 
 	@echo "Building for Linux arm..."
-	$(GOFLAGS) GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-arm cmd/serv/main.go
+	$(GOFLAGS) GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-arm ./cmd/serv
 
 	# Windows
 	@echo "Building for Windows amd64..."
-	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-amd64.exe cmd/serv/main.go
+	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-amd64.exe ./cmd/serv
 
 	@echo "Building for Windows arm64..."
-	$(GOFLAGS) GOOS=windows GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-arm64.exe cmd/serv/main.go
+	$(GOFLAGS) GOOS=windows GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-arm64.exe ./cmd/serv
 
 	# macOS
 	@echo "Building for macOS amd64..."
-	$(GOFLAGS) GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-darwin-amd64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=darwin GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-darwin-amd64 ./cmd/serv
 
 	@echo "Building for macOS arm64..."
-	$(GOFLAGS) GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-darwin-arm64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=darwin GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-darwin-arm64 ./cmd/serv
 
 	# FreeBSD
 	@echo "Building for FreeBSD amd64..."
-	$(GOFLAGS) GOOS=freebsd GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-freebsd-amd64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=freebsd GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-freebsd-amd64 ./cmd/serv
 
 	@echo "Compressing binaries..."
 	upx bin/uart_sms_forwarder-linux-* bin/uart_sms_forwarder-windows-* bin/uart_sms_forwarder-freebsd-* 2>/dev/null || true
@@ -66,12 +66,12 @@ build-linux:
 
 	# Linux amd64
 	@echo "Building for Linux amd64..."
-	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-amd64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-amd64 ./cmd/serv
 	upx bin/uart_sms_forwarder-linux-amd64
 
 	# Linux arm64
 	@echo "Building for Linux arm64..."
-	$(GOFLAGS) GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-arm64 cmd/serv/main.go
+	$(GOFLAGS) GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-linux-arm64 ./cmd/serv
 	upx bin/uart_sms_forwarder-linux-arm64
 
 	@echo "Linux binaries built successfully!"
@@ -81,8 +81,8 @@ build-linux:
 build-windows:
 	@echo "Building for Windows platforms..."
 	@mkdir -p bin
-	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-amd64.exe cmd/serv/main.go
-	$(GOFLAGS) GOOS=windows GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-arm64.exe cmd/serv/main.go
+	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-amd64.exe ./cmd/serv
+	$(GOFLAGS) GOOS=windows GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-arm64.exe ./cmd/serv
 	@echo "Windows binaries built successfully!"
 	@ls -lh bin/uart_sms_forwarder-windows-*.exe
 
@@ -104,14 +104,14 @@ clean:
 dev:
 	@echo "Building for development..."
 	@mkdir -p bin
-	go build -o bin/uart_sms_forwarder cmd/serv/main.go
+	go build -o bin/uart_sms_forwarder ./cmd/serv
 	@echo "Development build completed!"
 	@ls -lh bin/
 
 # 运行（开发模式）
 run:
 	@echo "Running in development mode..."
-	go run cmd/serv/main.go
+	go run ./cmd/serv
 
 # 默认目标
 build: build-release

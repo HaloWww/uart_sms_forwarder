@@ -229,40 +229,21 @@ tar -zxvf uart_sms_forwarder-linux-amd64.tar.gz -C /opt/
 mv /opt/uart_sms_forwarder-linux-amd64 /opt/uart_sms_forwarder
 ```
 
-创建系统服务
+自动安装并启动 systemd 服务（需要 root 权限）：
 
 ```shell
-cat <<EOF > /etc/systemd/system/uart_sms_forwarder.service
-[Unit]
-Description=uart_sms_forwarder service
-After=network.target
-
-[Service]
-User=root
-WorkingDirectory=/opt/uart_sms_forwarder
-ExecStart=/opt/uart_sms_forwarder/uart_sms_forwarder
-TimeoutSec=0
-RestartSec=10
-Restart=always
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+sudo /opt/uart_sms_forwarder/uart_sms_forwarder \
+  -install-service \
+  -config /opt/uart_sms_forwarder/config.yaml
 ```
 
-创建 sqllite 目录
+该命令会创建默认的 `data`、`logs` 目录，生成 `/etc/systemd/system/uart_sms_forwarder.service`，执行 `systemctl daemon-reload`，设置开机启动并立即启动服务。重复执行可更新已有服务配置；如果在 `config.yaml` 中使用了其他数据或日志目录，请提前创建相应目录。
 
-```shell
-mkdir /opt/uart_sms_forwarder/data
-```
+查看服务状态和日志：
 
-启动服务
-
-```shell
-systemctl daemon-reload
-systemctl enable uart_sms_forwarder
-systemctl start uart_sms_forwarder
+```bash
+systemctl status uart_sms_forwarder.service
+journalctl -u uart_sms_forwarder.service -f
 ```
 
 打开浏览器访问 8080 端口。
