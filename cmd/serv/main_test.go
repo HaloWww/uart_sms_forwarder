@@ -2,7 +2,9 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -66,7 +68,7 @@ func TestBuildSystemdUnit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		`WorkingDirectory="/opt/uart sms"`,
+		`WorkingDirectory=/opt/uart sms`,
 		`ExecStart="/opt/uart sms/uart_sms_forwarder" -config "/opt/uart sms/config.yaml"`,
 		`Restart=always`,
 		`WantedBy=multi-user.target`,
@@ -77,8 +79,43 @@ func TestBuildSystemdUnit(t *testing.T) {
 	}
 }
 
+func TestBuildSystemdUnitEscapesSpecifiers(t *testing.T) {
+	unit, err := buildSystemdUnit(`/opt/100%/$app`, `/opt/100%/$config/config.yaml`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`WorkingDirectory=/opt/100%%/$config`,
+		`ExecStart="/opt/100%%/$$app" -config "/opt/100%%/$$config/config.yaml"`,
+	} {
+		if !strings.Contains(unit, expected) {
+			t.Errorf("unit does not contain %q:\n%s", expected, unit)
+		}
+	}
+}
+
 func TestBuildSystemdUnitRejectsNewline(t *testing.T) {
 	if _, err := buildSystemdUnit("/opt/app\ninvalid", "/opt/config.yaml"); err == nil {
 		t.Fatal("expected newline path to be rejected")
+	}
+}
+
+func TestBuildSystemdUnitPassesSystemdAnalyze(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd-analyze verification only runs on Linux")
+	}
+	if _, err := exec.LookPath("systemd-analyze"); err != nil {
+		t.Skip("systemd-analyze is not installed")
+	}
+	unit, err := buildSystemdUnit("/bin/true", "/tmp/config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(t.TempDir(), "uart_sms_forwarder-test.service")
+	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("systemd-analyze", "verify", unitPath).CombinedOutput(); err != nil {
+		t.Fatalf("systemd unit verification failed: %v\n%s", err, output)
 	}
 }

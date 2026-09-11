@@ -151,9 +151,12 @@ func buildSystemdUnit(executablePath, configPath string) (string, error) {
 	quote := func(value string) string {
 		value = strings.ReplaceAll(value, `\`, `\\`)
 		value = strings.ReplaceAll(value, `"`, `\"`)
+		value = strings.ReplaceAll(value, `%`, `%%`)
+		value = strings.ReplaceAll(value, `$`, `$$`)
 		return `"` + value + `"`
 	}
 	workingDirectory := path.Dir(configPath)
+	workingDirectory = strings.ReplaceAll(workingDirectory, `%`, `%%`)
 	return fmt.Sprintf(`[Unit]
 Description=UART SMS Forwarder
 Wants=network-online.target
@@ -169,7 +172,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-`, quote(workingDirectory), quote(executablePath), quote(configPath)), nil
+`, workingDirectory, quote(executablePath), quote(configPath)), nil
 }
 
 func defaultConfigPath() string {
