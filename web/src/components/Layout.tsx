@@ -48,7 +48,7 @@ export default function Layout() {
                 ? 'SIM 身份冲突'
                 : !selectedSim?.online
                     ? 'SIM 当前离线'
-                    : !selectedSim.scriptCompatible
+                    : selectedSim.currentStatus?.version && !selectedSim.scriptCompatible
                         ? '请升级 Air780 main.lua'
                         : !selectedSim.sendReady ? '正在确认多设备 SIM 身份' : 'SIM 已上线';
 
@@ -237,7 +237,7 @@ export default function Layout() {
                                         ? '仅历史'
                                         : selectedSim?.conflict
                                             ? '身份冲突'
-                                            : selectedSim?.online && !selectedSim.scriptCompatible
+                                            : selectedSim?.online && selectedSim.currentStatus?.version && !selectedSim.scriptCompatible
                                                 ? '脚本需升级'
                                                 : selectedSim?.online ? '身份确认中' : 'SIM 离线'}
                             </div>

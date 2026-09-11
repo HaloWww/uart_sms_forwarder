@@ -1,6 +1,7 @@
 import {useMemo, useState, type ComponentProps, type ReactNode} from 'react';
 import {
     Bell,
+    BellRing,
     Bot,
     Building2,
     ExternalLink,
@@ -8,6 +9,7 @@ import {
     Loader2,
     Mail,
     MessageSquare,
+    PanelsTopLeft,
     Save,
     TestTube,
     type LucideIcon,
@@ -21,8 +23,12 @@ import {Select, SelectContent, SelectItem, SelectTrigger, SelectValue} from '@/c
 import {Switch} from '@/components/ui/switch';
 import {Textarea} from '@/components/ui/textarea';
 import {
+    DEFAULT_SMS_FORWARDING_TEMPLATE,
+    getSMSForwardingConfig,
     getNotificationChannels,
     type NotificationChannel,
+    type SMSForwardingConfig,
+    saveSMSForwardingConfig,
     saveNotificationChannels,
     testNotificationChannel,
 } from '@/api/property.ts';
@@ -33,6 +39,8 @@ type ChannelType = NotificationChannel['type'];
 type EnabledField =
     | 'dingtalkEnabled'
     | 'wecomEnabled'
+    | 'wecomAppEnabled'
+    | 'barkEnabled'
     | 'feishuEnabled'
     | 'webhookEnabled'
     | 'emailEnabled'
@@ -44,6 +52,21 @@ interface FormValues {
     dingtalkSignSecret: string;
     wecomEnabled: boolean;
     wecomSecretKey: string;
+    wecomAppEnabled: boolean;
+    wecomAppCorpId: string;
+    wecomAppAgentId: string;
+    wecomAppSecret: string;
+    wecomAppToUser: string;
+    wecomAppProxyEnabled: boolean;
+    wecomAppProxyUrl: string;
+    wecomAppProxyUsername: string;
+    wecomAppProxyPassword: string;
+    barkEnabled: boolean;
+    barkServerUrl: string;
+    barkDeviceKey: string;
+    barkTitle: string;
+    barkGroup: string;
+    barkSound: string;
     feishuEnabled: boolean;
     feishuSecretKey: string;
     feishuSignSecret: string;
@@ -85,6 +108,21 @@ const DEFAULT_FORM_VALUES: FormValues = {
     dingtalkSignSecret: '',
     wecomEnabled: false,
     wecomSecretKey: '',
+    wecomAppEnabled: false,
+    wecomAppCorpId: '',
+    wecomAppAgentId: '',
+    wecomAppSecret: '',
+    wecomAppToUser: '@all',
+    wecomAppProxyEnabled: false,
+    wecomAppProxyUrl: '',
+    wecomAppProxyUsername: '',
+    wecomAppProxyPassword: '',
+    barkEnabled: false,
+    barkServerUrl: 'https://api.day.app',
+    barkDeviceKey: '',
+    barkTitle: 'UART 短信转发器',
+    barkGroup: '短信转发',
+    barkSound: '',
     feishuEnabled: false,
     feishuSecretKey: '',
     feishuSignSecret: '',
@@ -122,11 +160,27 @@ const CHANNELS: ChannelDefinition[] = [
     },
     {
         type: 'wecom',
-        name: '企业微信',
+        name: '企业微信群机器人',
         description: '群机器人通知',
         enabledField: 'wecomEnabled',
         icon: Building2,
         docsUrl: 'https://work.weixin.qq.com/api/doc/90000/90136/91770',
+    },
+    {
+        type: 'wecom_app',
+        name: '企业微信应用',
+        description: '自建应用消息通知',
+        enabledField: 'wecomAppEnabled',
+        icon: PanelsTopLeft,
+        docsUrl: 'https://developer.work.weixin.qq.com/document/path/90236',
+    },
+    {
+        type: 'bark',
+        name: 'Bark',
+        description: 'iPhone Bark 推送',
+        enabledField: 'barkEnabled',
+        icon: BellRing,
+        docsUrl: 'https://bark.day.app/#/en-us/',
     },
     {
         type: 'feishu',
@@ -173,6 +227,8 @@ function channelsToFormValues(channels: NotificationChannel[]): FormValues {
     const find = (type: ChannelType) => channels.find((channel) => channel.type === type);
     const dingtalk = find('dingtalk');
     const wecom = find('wecom');
+    const wecomApp = find('wecom_app');
+    const bark = find('bark');
     const feishu = find('feishu');
     const webhook = find('webhook');
     const email = find('email');
@@ -183,6 +239,21 @@ function channelsToFormValues(channels: NotificationChannel[]): FormValues {
     values.dingtalkSignSecret = getStringConfig(dingtalk, 'signSecret');
     values.wecomEnabled = wecom?.enabled ?? false;
     values.wecomSecretKey = getStringConfig(wecom, 'secretKey');
+    values.wecomAppEnabled = wecomApp?.enabled ?? false;
+    values.wecomAppCorpId = getStringConfig(wecomApp, 'corpId');
+    values.wecomAppAgentId = getStringConfig(wecomApp, 'agentId');
+    values.wecomAppSecret = getStringConfig(wecomApp, 'secret');
+    values.wecomAppToUser = getStringConfig(wecomApp, 'toUser', '@all');
+    values.wecomAppProxyEnabled = getBooleanConfig(wecomApp, 'proxyEnabled');
+    values.wecomAppProxyUrl = getStringConfig(wecomApp, 'proxyUrl');
+    values.wecomAppProxyUsername = getStringConfig(wecomApp, 'proxyUsername');
+    values.wecomAppProxyPassword = getStringConfig(wecomApp, 'proxyPassword');
+    values.barkEnabled = bark?.enabled ?? false;
+    values.barkServerUrl = getStringConfig(bark, 'serverUrl', 'https://api.day.app');
+    values.barkDeviceKey = getStringConfig(bark, 'deviceKey');
+    values.barkTitle = getStringConfig(bark, 'title', 'UART 短信转发器');
+    values.barkGroup = getStringConfig(bark, 'group', '短信转发');
+    values.barkSound = getStringConfig(bark, 'sound');
     values.feishuEnabled = feishu?.enabled ?? false;
     values.feishuSecretKey = getStringConfig(feishu, 'secretKey');
     values.feishuSignSecret = getStringConfig(feishu, 'signSecret');
@@ -240,16 +311,25 @@ export default function NotificationChannels() {
     const queryClient = useQueryClient();
     const [selectedType, setSelectedType] = useState<ChannelType>('dingtalk');
     const [draft, setDraft] = useState<FormValues | null>(null);
+    const [forwardingDraft, setForwardingDraft] = useState<SMSForwardingConfig | null>(null);
 
     const {data: channels = [], isLoading} = useQuery({
         queryKey: ['notificationChannels'],
         queryFn: getNotificationChannels,
+    });
+    const {data: forwardingConfig, isLoading: forwardingLoading} = useQuery({
+        queryKey: ['smsForwardingConfig'],
+        queryFn: getSMSForwardingConfig,
     });
 
     const serverValues = useMemo(() => channelsToFormValues(channels), [channels]);
     const formValues = draft ?? serverValues;
     const selectedChannel = CHANNELS.find((channel) => channel.type === selectedType) ?? CHANNELS[0];
     const selectedEnabled = formValues[selectedChannel.enabledField];
+    const forwardingForm = forwardingDraft ?? forwardingConfig ?? {
+        enabled: false,
+        template: DEFAULT_SMS_FORWARDING_TEMPLATE,
+    };
 
     const updateField = <K extends keyof FormValues>(field: K, value: FormValues[K]) => {
         setDraft((current) => ({...(current ?? serverValues), [field]: value}));
@@ -277,6 +357,28 @@ export default function NotificationChannels() {
         },
     });
 
+    const saveForwardingMutation = useMutation({
+        mutationFn: saveSMSForwardingConfig,
+        onSuccess: async () => {
+            toast.success('全局短信转发格式已保存');
+            await queryClient.invalidateQueries({queryKey: ['smsForwardingConfig']});
+            setForwardingDraft(null);
+        },
+        onError: () => toast.error('保存短信转发格式失败'),
+    });
+
+    const updateForwarding = (patch: Partial<SMSForwardingConfig>) => {
+        setForwardingDraft((current) => ({...(current ?? forwardingForm), ...patch}));
+    };
+
+    const handleSaveForwarding = () => {
+        if (forwardingForm.enabled && !forwardingForm.template.trim()) {
+            toast.error('启用短信转发包装时模板不能为空');
+            return;
+        }
+        saveForwardingMutation.mutate(forwardingForm);
+    };
+
     const handleSave = () => {
         let webhookHeaders: Record<string, unknown> | undefined;
         if (formValues.webhookHeaders.trim()) {
@@ -298,6 +400,11 @@ export default function NotificationChannels() {
             setSelectedType('telegram');
             return;
         }
+        if (formValues.wecomAppProxyEnabled && !formValues.wecomAppProxyUrl.trim()) {
+            toast.error('企业微信应用已启用代理，但未填写代理地址');
+            setSelectedType('wecom_app');
+            return;
+        }
 
         const nextChannels: NotificationChannel[] = [];
         if (formValues.dingtalkEnabled || formValues.dingtalkSecretKey) {
@@ -312,6 +419,35 @@ export default function NotificationChannels() {
                 type: 'wecom',
                 enabled: formValues.wecomEnabled,
                 config: {secretKey: formValues.wecomSecretKey},
+            });
+        }
+        if (formValues.wecomAppEnabled || formValues.wecomAppCorpId || formValues.wecomAppSecret) {
+            nextChannels.push({
+                type: 'wecom_app',
+                enabled: formValues.wecomAppEnabled,
+                config: {
+                    corpId: formValues.wecomAppCorpId,
+                    agentId: formValues.wecomAppAgentId,
+                    secret: formValues.wecomAppSecret,
+                    toUser: formValues.wecomAppToUser,
+                    proxyEnabled: formValues.wecomAppProxyEnabled,
+                    proxyUrl: formValues.wecomAppProxyUrl,
+                    proxyUsername: formValues.wecomAppProxyUsername,
+                    proxyPassword: formValues.wecomAppProxyPassword,
+                },
+            });
+        }
+        if (formValues.barkEnabled || formValues.barkDeviceKey) {
+            nextChannels.push({
+                type: 'bark',
+                enabled: formValues.barkEnabled,
+                config: {
+                    serverUrl: formValues.barkServerUrl,
+                    deviceKey: formValues.barkDeviceKey,
+                    title: formValues.barkTitle,
+                    group: formValues.barkGroup,
+                    sound: formValues.barkSound,
+                },
             });
         }
         if (formValues.feishuEnabled || formValues.feishuSecretKey) {
@@ -389,6 +525,71 @@ export default function NotificationChannels() {
                         <ChannelInput value={formValues.wecomSecretKey} onChange={(event) => updateField('wecomSecretKey', event.target.value)} placeholder="企业微信群机器人 key" className={inputClass}/>
                     </Field>
                 );
+            case 'wecom_app':
+                return (
+                    <div className="grid gap-5">
+                        <div className="grid gap-4 sm:grid-cols-2">
+                            <Field label="企业 ID（CorpID）" required>
+                                <ChannelInput value={formValues.wecomAppCorpId} onChange={(event) => updateField('wecomAppCorpId', event.target.value)} placeholder="ww..." className={inputClass}/>
+                            </Field>
+                            <Field label="应用 AgentID" required>
+                                <ChannelInput inputMode="numeric" value={formValues.wecomAppAgentId} onChange={(event) => updateField('wecomAppAgentId', event.target.value)} placeholder="1000002" className={inputClass}/>
+                            </Field>
+                        </div>
+                        <Field label="应用 Secret" required hint="在企业微信管理后台的自建应用详情中获取。">
+                            <ChannelInput type="password" value={formValues.wecomAppSecret} onChange={(event) => updateField('wecomAppSecret', event.target.value)} className={inputClass}/>
+                        </Field>
+                        <Field label="接收成员" hint="成员账号，多人用 | 分隔；@all 表示应用可见范围内全部成员。">
+                            <ChannelInput value={formValues.wecomAppToUser} onChange={(event) => updateField('wecomAppToUser', event.target.value)} placeholder="@all" className={inputClass}/>
+                        </Field>
+                        <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                            <div className="flex items-center justify-between gap-4">
+                                <div>
+                                    <p className="text-sm font-semibold text-slate-800">使用 HTTP 代理</p>
+                                    <p className="mt-1 text-xs text-slate-500">获取 Access Token 和发送应用消息都会通过此代理。</p>
+                                </div>
+                                <Switch checked={formValues.wecomAppProxyEnabled} onCheckedChange={(checked) => updateField('wecomAppProxyEnabled', checked)} className="data-[state=checked]:bg-blue-600"/>
+                            </div>
+                            {formValues.wecomAppProxyEnabled && (
+                                <div className="mt-4 grid gap-4 border-t border-slate-200 pt-4">
+                                    <Field label="代理地址" required hint="支持 http://、https:// 和 socks5://。">
+                                        <ChannelInput value={formValues.wecomAppProxyUrl} onChange={(event) => updateField('wecomAppProxyUrl', event.target.value)} placeholder="http://127.0.0.1:7890" className={inputClass}/>
+                                    </Field>
+                                    <div className="grid gap-4 sm:grid-cols-2">
+                                        <Field label="代理用户名">
+                                            <ChannelInput value={formValues.wecomAppProxyUsername} onChange={(event) => updateField('wecomAppProxyUsername', event.target.value)} className={inputClass}/>
+                                        </Field>
+                                        <Field label="代理密码">
+                                            <ChannelInput type="password" value={formValues.wecomAppProxyPassword} onChange={(event) => updateField('wecomAppProxyPassword', event.target.value)} className={inputClass}/>
+                                        </Field>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                );
+            case 'bark':
+                return (
+                    <div className="grid gap-5">
+                        <Field label="Bark 服务地址" required hint="支持官方 api.day.app 或自建 Bark Server。">
+                            <ChannelInput type="url" value={formValues.barkServerUrl} onChange={(event) => updateField('barkServerUrl', event.target.value)} placeholder="https://api.day.app" className={inputClass}/>
+                        </Field>
+                        <Field label="Device Key" required hint="打开 Bark App，复制推送地址中的设备 Key。">
+                            <ChannelInput type="password" value={formValues.barkDeviceKey} onChange={(event) => updateField('barkDeviceKey', event.target.value)} className={inputClass}/>
+                        </Field>
+                        <div className="grid gap-4 sm:grid-cols-2">
+                            <Field label="通知标题">
+                                <ChannelInput value={formValues.barkTitle} onChange={(event) => updateField('barkTitle', event.target.value)} className={inputClass}/>
+                            </Field>
+                            <Field label="通知分组">
+                                <ChannelInput value={formValues.barkGroup} onChange={(event) => updateField('barkGroup', event.target.value)} className={inputClass}/>
+                            </Field>
+                        </div>
+                        <Field label="提示音" hint="可选，填写 Bark 中的提示音名称。">
+                            <ChannelInput value={formValues.barkSound} onChange={(event) => updateField('barkSound', event.target.value)} placeholder="例如 minuet" className={inputClass}/>
+                        </Field>
+                    </div>
+                );
             case 'feishu':
                 return (
                     <div className="grid gap-5">
@@ -423,7 +624,7 @@ export default function NotificationChannels() {
                         <Field label="请求头（JSON）" hint="可选，必须是一个合法的 JSON 对象。">
                             <Textarea value={formValues.webhookHeaders} onChange={(event) => updateField('webhookHeaders', event.target.value)} placeholder={'{\n  "Authorization": "Bearer token"\n}'} className="min-h-28 resize-y bg-slate-50 font-mono text-xs"/>
                         </Field>
-                        <Field label="请求体模板" required hint="可使用 {{from}}、{{content}} 和 {{timestamp}} 占位符。">
+                        <Field label="请求体模板" required hint="可使用 {{from}}、{{receiver}}、{{content}}、{{timestamp}} 和 SIM/设备信息占位符。">
                             <Textarea value={formValues.webhookBody} onChange={(event) => updateField('webhookBody', event.target.value)} className="min-h-36 resize-y bg-slate-50 font-mono text-xs"/>
                         </Field>
                     </div>
@@ -498,7 +699,7 @@ export default function NotificationChannels() {
         }
     };
 
-    if (isLoading) {
+    if (isLoading || forwardingLoading) {
         return (
             <div className="flex items-center justify-center py-20 text-sm text-slate-500">
                 <Loader2 className="mr-2 size-5 animate-spin text-blue-600"/>
@@ -514,15 +715,36 @@ export default function NotificationChannels() {
             <PageHeader
                 title="通知渠道"
                 description="配置短信和设备事件的第三方推送渠道。"
-                action={<Button
-                    onClick={handleSave}
-                    disabled={!draft || saveMutation.isPending}
-                    className="bg-blue-600 text-white hover:bg-blue-700"
-                >
-                    {saveMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Save className="size-4"/>}
-                    {saveMutation.isPending ? '保存中...' : draft ? '保存配置' : '已保存'}
-                </Button>}
             />
+
+            <Card className="gap-0 overflow-hidden py-0">
+                <CardHeader className="border-b border-slate-100 py-5">
+                    <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                            <CardTitle className="text-base">全局短信转发格式</CardTitle>
+                            <p className="mt-1 text-xs text-slate-500">统一包装所有通知渠道中的入站短信正文，不修改短信中心保存的原始内容。</p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            <span className="text-xs font-medium text-slate-600">启用自定义包装</span>
+                            <Switch checked={forwardingForm.enabled} onCheckedChange={(enabled) => updateForwarding({enabled})} className="data-[state=checked]:bg-blue-600"/>
+                            <Button onClick={handleSaveForwarding} disabled={!forwardingDraft || saveForwardingMutation.isPending} size="sm" className="bg-blue-600 text-white hover:bg-blue-700">
+                                {saveForwardingMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Save className="size-4"/>}
+                                {forwardingDraft ? '保存格式' : '已保存'}
+                            </Button>
+                        </div>
+                    </div>
+                </CardHeader>
+                <CardContent className="space-y-3 py-5">
+                    <div className="flex items-center justify-between gap-3">
+                        <label htmlFor="sms-forwarding-template" className="text-xs font-semibold text-slate-700">通知正文模板</label>
+                        <Button type="button" variant="outline" size="sm" onClick={() => updateForwarding({template: DEFAULT_SMS_FORWARDING_TEMPLATE})}>恢复推荐模板</Button>
+                    </div>
+                    <Textarea id="sms-forwarding-template" value={forwardingForm.template} onChange={(event) => updateForwarding({template: event.target.value})} className="min-h-40 resize-y bg-slate-50 font-mono text-sm" maxLength={16384}/>
+                    <p className="text-xs leading-5 text-slate-500">
+                        可用变量：{'{{content}}'} 短信内容、{'{{receiver}}'} 接收手机号、{'{{from}}'} 发送方、{'{{timestamp}}'} 接收时间、{'{{device_name}}'} 设备名、{'{{sim_id}}'}、{'{{iccid}}'}、{'{{imsi}}'}、{'{{imei}}'}。
+                    </p>
+                </CardContent>
+            </Card>
 
             <div className="grid items-start gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
                 <Card className="gap-0 py-0">
@@ -623,12 +845,23 @@ export default function NotificationChannels() {
                         >
                             {renderConfig()}
                         </fieldset>
-                        {draft && (
-                            <div className="mt-6 flex items-center gap-2 border-t border-slate-100 pt-4 text-xs text-amber-700">
-                                <span className="size-1.5 rounded-full bg-amber-500"/>
-                                当前配置尚未保存，保存后才能发送测试通知。
+                        <div className="mt-6 flex flex-col gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:items-center sm:justify-between">
+                            <div className={cn(
+                                'flex items-center gap-2 text-xs',
+                                draft ? 'text-amber-700' : 'text-slate-400',
+                            )}>
+                                <span className={cn('size-1.5 rounded-full', draft ? 'bg-amber-500' : 'bg-emerald-500')}/>
+                                {draft ? '当前渠道配置尚未保存，保存后才能发送测试通知。' : '当前通知渠道配置已保存。'}
                             </div>
-                        )}
+                            <Button
+                                onClick={handleSave}
+                                disabled={!draft || saveMutation.isPending}
+                                className="min-w-32 bg-blue-600 text-white hover:bg-blue-700"
+                            >
+                                {saveMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Save className="size-4"/>}
+                                {saveMutation.isPending ? '保存中...' : draft ? '保存配置' : '已保存'}
+                            </Button>
+                        </div>
                     </CardContent>
                 </Card>
             </div>

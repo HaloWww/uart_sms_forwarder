@@ -18,7 +18,8 @@
 - 短信记录
 - 发送短信
 - 来电通知
-- 支持钉钉、企业微信、飞书、自定义 webhook、邮箱通知
+- 支持钉钉、企业微信群机器人、企业微信应用、Bark、飞书、自定义 webhook、邮箱和 Telegram 通知
+- 支持全局自定义入站短信转发正文，可附加接收手机号、发送方、接收时间及 SIM/设备信息
 - 计划任务发送短信
 - 同时管理多台 Air780，短信、状态和计划任务按 SIM 卡（ICCID）隔离
 - 串口断线重连、接收 ACK/去重和发送结果超时保护
@@ -45,6 +46,17 @@ App:
 ```
 
 `Ports` 只控制允许打开哪些物理端口，不决定数据属于哪张卡；Linux/macOS 下也可填写 `/dev/serial/by-id/...` 一类指向设备节点的稳定软链接。系统会为连接生成仅用于日志和诊断的内部 `deviceId`；普通用户界面不需要选择设备。
+
+Windows 会通过系统串口信息识别 USB COM 口。如果驱动未提供完整的 USB 元数据，或只希望探测指定设备，可在“设备管理器 → 端口 (COM 和 LPT)”中确认端口名并配置白名单：
+
+```yaml
+App:
+  Serial:
+    AutoDiscover: true
+    Ports:
+      - "COM3"
+      - "COM4"
+```
 
 界面优先用运营商返回的手机号码区分 SIM，并把已读取到的号码持久保存，SIM 离线时也不会退回串口名；没有号码的卡才显示 ICCID 尾号。真正的数据归属始终使用 ICCID，不依赖可能为空或变化的显示号码。
 
@@ -77,6 +89,18 @@ devices:
 如果自动模式没有发现设备，请依次确认：已烧录 1.4.0+ 脚本、当前用户有串口权限、Docker 已映射设备节点，以及 `Ports` 白名单与容器内路径一致。启用 debug 日志后可区分“无法枚举串口”“端口无法打开”和“未通过项目握手”。
 
 不同 Air780 型号、底板和固件对运行中热插拔 SIM 的检测能力不同。为了保证路由及时刷新，建议先断电换卡，再重新上电；如果确认当前硬件支持热插拔，也应等待 Web 中两张 SIM 都显示在新的模块上后再发送。
+
+## 通知渠道与转发格式
+
+“通知渠道”页面除群机器人外，也支持企业微信自建应用（CorpID、AgentID、Secret、接收成员）和 Bark。企业微信应用可为获取 Access Token 与发送消息统一配置 HTTP/HTTPS/SOCKS5 代理；Bark 可使用 `https://api.day.app`，也可填写自建 Bark Server 地址。
+
+通知渠道页面顶部直接展示“全局短信转发格式”，对所有已启用渠道生效，但不会改写数据库中保存的原始短信。模板支持以下变量：
+
+- `{{content}}`：原始短信内容
+- `{{receiver}}` / `{{to}}`：接收此短信的 SIM 手机号
+- `{{from}}`：短信发送方
+- `{{timestamp}}`：短信接收时间
+- `{{device_name}}`、`{{sim_id}}`、`{{iccid}}`、`{{imsi}}`、`{{imei}}`：设备和 SIM 信息
 
 主要 API：
 
@@ -129,15 +153,54 @@ devices:
 
 ### 5. 运行上位机程序
 
+#### Windows 原生运行
+
+1. 从 Release 下载 `uart_sms_forwarder-windows-amd64.zip`（普通 Intel/AMD Windows 电脑）或 `uart_sms_forwarder-windows-arm64.zip`，解压到一个可写目录。
+2. 编辑解压目录中的 `config.yaml`，至少修改管理员密码和 JWT 密钥。数据库及日志默认保存在同目录的 `data`、`logs` 文件夹中。
+3. 用 USB 连接 Air780，并在设备管理器确认串口驱动已正常加载。
+4. 在 PowerShell 中运行：
+
+```powershell
+Set-Location C:\path\to\uart_sms_forwarder-windows-amd64
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+也可以直接运行程序，并通过 `-config` 指定任意位置的配置文件：
+
+```powershell
+.\uart_sms_forwarder.exe -config D:\uart-sms\config.yaml
+```
+
+程序会把配置文件所在目录作为工作目录，因此配置中的 `./data/app.db` 和 `./logs/sms.log` 在从快捷方式或其他目录启动时也能保持一致。启动后访问 [http://localhost:8080](http://localhost:8080)。如果其他电脑需要访问，请允许 Windows 防火墙中的 TCP 8080 入站连接。
+
+从源码构建需要 Go 1.26、Node.js 24 和 npm：
+
+```powershell
+.\scripts\windows\build.ps1 -Architecture amd64
+```
+
+产物位于 `dist\uart_sms_forwarder-windows-amd64.zip`。
+
+#### 自动打包与发布
+
+仓库内置 GitHub Actions 发布流程。推送符合 `v1.2.3`（也支持 `v1.2.3-beta.1`）格式的标签后，会自动构建前端和多个平台的服务端，并创建 GitHub Release。也可以在 Actions 页面手动运行 `Release` 工作流并填写版本号。
+
+```shell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+发布产物包含 Linux、Windows、macOS 和 FreeBSD 压缩包以及 `SHA256SUMS`；Windows 压缩包内附 `start.ps1`、`config.yaml` 和 `main.lua`。
+
 #### docker 方式安装
 
 ```shell
 # 创建空目录
 mkdir /opt/uart_sms_forwarder
 # 下载 docker-compose.yml 文件
-wget https://raw.githubusercontent.com/dushixiang/uart_sms_forwarder/main/docker-compose.yml -O /opt/uart_sms_forwarder/docker-compose.yml
+wget https://raw.githubusercontent.com/HaloWww/uart_sms_forwarder/main/docker-compose.yml -O /opt/uart_sms_forwarder/docker-compose.yml
 # 下载 config.example.yaml 文件
-wget https://raw.githubusercontent.com/dushixiang/uart_sms_forwarder/main/config.example.yaml -O /opt/uart_sms_forwarder/config.yaml
+wget https://raw.githubusercontent.com/HaloWww/uart_sms_forwarder/main/config.example.yaml -O /opt/uart_sms_forwarder/config.yaml
 ```
 
 修改 `docker-compose.yml` 和 `config.yaml` 文件，主要是映射 USB 路径和修改密码。
@@ -157,7 +220,7 @@ docker-compose up -d
 下载
 
 ```shell
-wget https://github.com/dushixiang/uart_sms_forwarder/releases/latest/download/uart_sms_forwarder-linux-amd64.tar.gz
+wget https://github.com/HaloWww/uart_sms_forwarder/releases/latest/download/uart_sms_forwarder-linux-amd64.tar.gz
 ```
 
 解压
@@ -205,5 +268,3 @@ systemctl start uart_sms_forwarder
 打开浏览器访问 8080 端口。
 
 修改密码等配置项，请参考 [config.example.yaml](config.example.yaml) 文件。
-
-

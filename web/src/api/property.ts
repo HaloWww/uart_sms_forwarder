@@ -29,7 +29,7 @@ const PROPERTY_ID_NOTIFICATION_CHANNELS = 'notification_channels';
 
 // 通知渠道配置（通过 type 标识，不再使用独立ID）
 export interface NotificationChannel {
-    type: 'dingtalk' | 'wecom' | 'feishu' | 'email' | 'webhook' | 'telegram'; // 渠道类型，作为唯一标识
+    type: 'dingtalk' | 'wecom' | 'wecom_app' | 'bark' | 'feishu' | 'email' | 'webhook' | 'telegram'; // 渠道类型，作为唯一标识
     enabled: boolean; // 是否启用
     config: Record<string, any>; // JSON配置，根据type不同而不同
 }
@@ -48,6 +48,30 @@ export const saveNotificationChannels = async (channels: NotificationChannel[]):
 // 测试通知渠道（从数据库读取配置）
 export const testNotificationChannel = async (type: string): Promise<{ message: string }> => {
     return await apiClient.post<{ message: string }>(`/notifications/${type}/test`);
+};
+
+// ==================== 短信转发全局包装配置 ====================
+
+const PROPERTY_ID_SMS_FORWARDING_CONFIG = 'sms_forwarding_config';
+
+export const DEFAULT_SMS_FORWARDING_TEMPLATE = `{{content}}
+
+接收号码: {{receiver}}
+发送号码: {{from}}
+接收时间: {{timestamp}}`;
+
+export interface SMSForwardingConfig {
+    enabled: boolean;
+    template: string;
+}
+
+export const getSMSForwardingConfig = async (): Promise<SMSForwardingConfig> => {
+    const config = await getProperty<SMSForwardingConfig>(PROPERTY_ID_SMS_FORWARDING_CONFIG);
+    return config || {enabled: false, template: DEFAULT_SMS_FORWARDING_TEMPLATE};
+};
+
+export const saveSMSForwardingConfig = async (config: SMSForwardingConfig): Promise<void> => {
+    return saveProperty(PROPERTY_ID_SMS_FORWARDING_CONFIG, '短信转发包装配置', config);
 };
 
 // ==================== 自动飞行模式配置 ====================

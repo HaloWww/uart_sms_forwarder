@@ -18,11 +18,20 @@ const (
 	PropertyIDNotificationChannels = "notification_channels"
 	// PropertyIDAutoFlymodeConfig 自动飞行模式配置的固定 ID
 	PropertyIDAutoFlymodeConfig = "auto_flymode_config"
+	// PropertyIDSMSForwardingConfig 入站短信通知全局包装配置的固定 ID
+	PropertyIDSMSForwardingConfig = "sms_forwarding_config"
 
 	DefaultAutoFlymodeIdleTimeoutHours int64 = 1
 	MinAutoFlymodeIdleTimeoutHours     int64 = 1
 	MaxAutoFlymodeIdleTimeoutHours     int64 = 30 * 24
+	MaxSMSForwardingTemplateBytes            = 16 * 1024
 )
+
+const DefaultSMSForwardingTemplate = `{{content}}
+
+接收号码: {{receiver}}
+发送号码: {{from}}
+接收时间: {{timestamp}}`
 
 type PropertyService struct {
 	repo   *repo.PropertyRepo
@@ -147,6 +156,41 @@ func (s *PropertyService) SetAutoFlymodeConfig(ctx context.Context, config model
 	return s.Set(ctx, PropertyIDAutoFlymodeConfig, "自动飞行模式配置", config)
 }
 
+func DefaultSMSForwardingConfig() models.SMSForwardingConfig {
+	return models.SMSForwardingConfig{
+		Enabled:  false,
+		Template: DefaultSMSForwardingTemplate,
+	}
+}
+
+func ValidateSMSForwardingConfig(config models.SMSForwardingConfig) error {
+	if len(config.Template) > MaxSMSForwardingTemplateBytes {
+		return fmt.Errorf("短信转发模板不能超过 %d 字节", MaxSMSForwardingTemplateBytes)
+	}
+	if config.Enabled && config.Template == "" {
+		return fmt.Errorf("启用短信转发包装时模板不能为空")
+	}
+	return nil
+}
+
+func (s *PropertyService) GetSMSForwardingConfig(ctx context.Context) (models.SMSForwardingConfig, error) {
+	config := DefaultSMSForwardingConfig()
+	if err := s.GetValue(ctx, PropertyIDSMSForwardingConfig, &config); err != nil {
+		return models.SMSForwardingConfig{}, fmt.Errorf("获取短信转发配置失败: %w", err)
+	}
+	if err := ValidateSMSForwardingConfig(config); err != nil {
+		return models.SMSForwardingConfig{}, fmt.Errorf("短信转发配置无效: %w", err)
+	}
+	return config, nil
+}
+
+func (s *PropertyService) SetSMSForwardingConfig(ctx context.Context, config models.SMSForwardingConfig) error {
+	if err := ValidateSMSForwardingConfig(config); err != nil {
+		return err
+	}
+	return s.Set(ctx, PropertyIDSMSForwardingConfig, "短信转发包装配置", config)
+}
+
 // defaultPropertyConfig 默认配置项定义
 type defaultPropertyConfig struct {
 	ID    string
@@ -167,6 +211,11 @@ func (s *PropertyService) InitializeDefaultConfigs(ctx context.Context) error {
 			ID:    PropertyIDAutoFlymodeConfig,
 			Name:  "自动飞行模式配置",
 			Value: DefaultAutoFlymodeConfig(),
+		},
+		{
+			ID:    PropertyIDSMSForwardingConfig,
+			Name:  "短信转发包装配置",
+			Value: DefaultSMSForwardingConfig(),
 		},
 	}
 

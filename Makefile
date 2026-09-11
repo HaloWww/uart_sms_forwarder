@@ -1,4 +1,4 @@
-.PHONY: build-web build-server build-servers build-linux build-release clean dev run
+.PHONY: build-web build-server build-servers build-linux build-windows build-release clean dev run
 
 # 变量定义
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -76,6 +76,15 @@ build-linux:
 
 	@echo "Linux binaries built successfully!"
 	@ls -lh bin/
+
+# 构建 Windows 平台（无需 CGO，可在 Linux/macOS 上交叉编译）
+build-windows:
+	@echo "Building for Windows platforms..."
+	@mkdir -p bin
+	$(GOFLAGS) GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-amd64.exe cmd/serv/main.go
+	$(GOFLAGS) GOOS=windows GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o bin/uart_sms_forwarder-windows-arm64.exe cmd/serv/main.go
+	@echo "Windows binaries built successfully!"
+	@ls -lh bin/uart_sms_forwarder-windows-*.exe
 
 # 构建所有（发布版本）
 build-release:

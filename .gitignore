@@ -1,11 +1,13 @@
 
 # IntelliJ project files
 .idea
+.tools
 *.iml
 out
 gen
 data
 bin
+dist
 app.db
 config.yaml
 logs

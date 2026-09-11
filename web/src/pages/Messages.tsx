@@ -244,6 +244,7 @@ export default function Messages() {
         refetchInterval: 5000,
     });
 
+
     // 发送短信 Mutation
     const sendSMSMutation = useMutation({
 		mutationFn: (variables: SendSMSVariables) => sendSMS({
@@ -505,7 +506,7 @@ export default function Messages() {
         ? '“未分配短信”仅供查看和管理，不能用于发送'
         : selectedSim?.conflict
         ? '当前 SIM 身份冲突，已禁止发送'
-        : selectedSim?.online && !selectedSim.scriptCompatible
+        : selectedSim?.online && selectedSim.currentStatus?.version && !selectedSim.scriptCompatible
             ? '当前 Air780 脚本版本不兼容，请升级 main.lua'
         : selectedSimId ? '当前 SIM 离线或尚未完成识别' : '请先选择 SIM';
 

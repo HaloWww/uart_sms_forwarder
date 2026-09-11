@@ -62,6 +62,31 @@ func TestGetStatusReturnsCopy(t *testing.T) {
 	}
 }
 
+func TestGetStatusPreservesScriptVersionAcrossSIMStatusInvalidation(t *testing.T) {
+	service := NewSerialService(zap.NewNop(), config.SerialConfig{}, "default", "Air780", nil, nil, nil)
+	service.setConnected(true)
+	service.handleStatusResponse(&ParsedMessage{JSON: `{
+		"type":"status_response","version":"1.4.0",
+		"identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986000000000000001"}
+	}`})
+	service.flyMode.Store(true)
+	service.setFlymodeOwner("iccid:8986000000000000001")
+	service.invalidateDeviceStatus(true)
+
+	status, err := service.GetStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Version != "1.4.0" || !supportsSIMIdentityProtocol(status.Version) {
+		t.Fatalf("version after flymode invalidation = %q", status.Version)
+	}
+	service.resetPhysicalConnectionState()
+	status, _ = service.GetStatus()
+	if status.Version != "" {
+		t.Fatalf("version survived physical reset = %q", status.Version)
+	}
+}
+
 func TestGetStatusRejectsPreviousConnectionGeneration(t *testing.T) {
 	service := NewSerialService(zap.NewNop(), config.SerialConfig{}, "default", "Air780", nil, nil, nil)
 	service.setConnected(true)

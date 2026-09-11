@@ -87,6 +87,21 @@ func (h *PropertyHandler) SetProperty(c *echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"message": "设置成功"})
 	}
 
+	if id == service.PropertyIDSMSForwardingConfig {
+		value, err := json.Marshal(req.Value)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "无效的短信转发配置"})
+		}
+		var config models.SMSForwardingConfig
+		if err := json.Unmarshal(value, &config); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "无效的短信转发配置"})
+		}
+		if err := h.service.SetSMSForwardingConfig(c.Request().Context(), config); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"message": "设置成功"})
+	}
+
 	if err := h.service.Set(c.Request().Context(), id, req.Name, req.Value); err != nil {
 		h.logger.Error("设置属性失败", zap.String("id", id), zap.Error(err))
 		return c.JSON(http.StatusInternalServerError, map[string]string{
@@ -148,6 +163,10 @@ func (h *PropertyHandler) TestNotificationChannel(c *echo.Context) error {
 		sendErr = h.notifier.SendDingTalkByConfig(ctx, targetChannel.Config, message)
 	case "wecom":
 		sendErr = h.notifier.SendWeComByConfig(ctx, targetChannel.Config, message)
+	case "wecom_app":
+		sendErr = h.notifier.SendWeComAppByConfig(ctx, targetChannel.Config, message)
+	case "bark":
+		sendErr = h.notifier.SendBarkByConfig(ctx, targetChannel.Config, message)
 	case "feishu":
 		sendErr = h.notifier.SendFeishuByConfig(ctx, targetChannel.Config, message)
 	case "webhook":

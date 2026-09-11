@@ -37,3 +37,6 @@ App:
     # Ports:
     #   - "/dev/ttyUSB0"
     #   - "/dev/ttyUSB1"
+    # Windows 请填写设备管理器中显示的端口名，例如：
+    #   - "COM3"
+    #   - "COM4"

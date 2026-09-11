@@ -89,6 +89,10 @@ type SerialService struct {
 	statusEpoch     atomic.Uint64
 	statusAccepting atomic.Bool
 	statusMu        sync.Mutex
+	// Lua 版本属于物理连接而不是 SIM 身份。飞行模式会暂时失效 SIM
+	// 状态，但不能因此把已确认的脚本版本误判成“过旧”。
+	scriptVersionMu sync.RWMutex
+	scriptVersion   string
 
 	// 设备的飞行模式查询永远返回 false，无奈只能在应用层处理
 	flyMode           atomic.Bool
@@ -270,6 +274,23 @@ func (s *SerialService) invalidateDeviceStatus(acceptNew bool) {
 	s.statusAccepting.Store(acceptNew)
 }
 
+func (s *SerialService) rememberScriptVersion(version string) string {
+	version = strings.TrimSpace(version)
+	s.scriptVersionMu.Lock()
+	if version != "" {
+		s.scriptVersion = version
+	}
+	remembered := s.scriptVersion
+	s.scriptVersionMu.Unlock()
+	return remembered
+}
+
+func (s *SerialService) clearScriptVersion() {
+	s.scriptVersionMu.Lock()
+	s.scriptVersion = ""
+	s.scriptVersionMu.Unlock()
+}
+
 func (s *SerialService) setFlymodeOwner(simID string) {
 	s.flymodeOwnerMu.Lock()
 	s.flymodeOwnerSIMID = strings.TrimSpace(simID)
@@ -288,6 +309,7 @@ func (s *SerialService) resetPhysicalConnectionState() {
 	s.flyMode.Store(false)
 	s.autoFlymodeActive.Store(false)
 	s.setFlymodeOwner("")
+	s.clearScriptVersion()
 	s.manualFlymodeGen.Add(1)
 	s.recordSMSActivity()
 }
@@ -785,6 +807,7 @@ func (s *SerialService) GetStatus() (*StatusData, error) {
 		DeviceName: s.deviceName,
 		PortName:   portName,
 		Connected:  connected,
+		Version:    s.rememberScriptVersion(""),
 	}
 	return status, nil
 }

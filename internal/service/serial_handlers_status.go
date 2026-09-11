@@ -60,6 +60,7 @@ func (s *SerialService) handleStatusResponse(msg *ParsedMessage) {
 	}
 	statusData.DeviceID = s.deviceID
 	statusData.DeviceName = s.deviceName
+	statusData.Version = s.rememberScriptVersion(statusData.Version)
 	statusData.Mobile.Iccid = normalizeIdentityValue(statusData.Mobile.Iccid)
 	statusData.Mobile.Imsi = normalizeIdentityValue(statusData.Mobile.Imsi)
 	statusData.Mobile.Imei = normalizeIdentityValue(statusData.Mobile.Imei)
@@ -154,6 +155,9 @@ func (s *SerialService) handleSystemReady(msg *ParsedMessage) {
 	}
 	// 模块重启后，重启前的身份和脚本版本一律失效。
 	s.resetPhysicalConnectionState()
+	if version, ok := msg.Payload["version"].(string); ok {
+		s.rememberScriptVersion(version)
+	}
 	s.invalidateDeviceStatus(true)
 	go s.RequestCacheUpdate()
 }

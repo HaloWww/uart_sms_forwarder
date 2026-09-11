@@ -155,6 +155,11 @@ func (s *SerialService) ackIncomingSMS(messageID string) {
 
 // sendNotification 发送通知
 func (s *SerialService) sendNotification(ctx context.Context, sms IncomingSMS) {
+	receiver := ""
+	if status, _ := s.GetStatus(); status != nil &&
+		normalizeIdentityValue(status.Mobile.Iccid) == normalizeIdentityValue(sms.ICCID) {
+		receiver = strings.TrimSpace(status.Mobile.Number)
+	}
 	// 转换为通用通知消息
 	msg := NotificationMessage{
 		Type:       "sms",
@@ -165,8 +170,10 @@ func (s *SerialService) sendNotification(ctx context.Context, sms IncomingSMS) {
 		IMSI:       normalizeIdentityValue(sms.IMSI),
 		IMEI:       normalizeIdentityValue(sms.IMEI),
 		From:       sms.From,
+		To:         receiver,
 		Content:    sms.Content,
 		Timestamp:  sms.Timestamp,
+		Incoming:   true,
 	}
 
 	s.sendNotificationMessage(ctx, msg)
@@ -184,6 +191,16 @@ func (s *SerialService) sendNotificationMessage(ctx context.Context, msg Notific
 		return
 	}
 
+	// 入站短信的包装配置是全局配置，所有渠道共享同一份最终正文。
+	if msg.Type == "sms" && msg.Incoming {
+		formatConfig, formatErr := s.propertyService.GetSMSForwardingConfig(ctx)
+		if formatErr != nil {
+			s.logger.Error("获取短信转发包装配置失败，使用默认格式", zap.Error(formatErr))
+		} else if formatConfig.Enabled {
+			msg.Rendered = formatSMSForwardingMessage(formatConfig.Template, msg)
+		}
+	}
+
 	// 格式化消息
 	message := msg.String()
 
@@ -199,6 +216,10 @@ func (s *SerialService) sendNotificationMessage(ctx context.Context, msg Notific
 			sendErr = s.notifier.SendDingTalkByConfig(ctx, channel.Config, message)
 		case "wecom":
 			sendErr = s.notifier.SendWeComByConfig(ctx, channel.Config, message)
+		case "wecom_app":
+			sendErr = s.notifier.SendWeComAppByConfig(ctx, channel.Config, message)
+		case "bark":
+			sendErr = s.notifier.SendBarkByConfig(ctx, channel.Config, message)
 		case "feishu":
 			sendErr = s.notifier.SendFeishuByConfig(ctx, channel.Config, message)
 		case "webhook":

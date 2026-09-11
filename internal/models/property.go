@@ -15,7 +15,7 @@ func (Property) TableName() string {
 
 // NotificationChannelConfig 通知渠道配置（存储在 Property 中）
 type NotificationChannelConfig struct {
-	Type    string                 `json:"type"`    // 类型: dingtalk, wecom, feishu, webhook
+	Type    string                 `json:"type"`    // 类型: dingtalk, wecom, wecom_app, bark, feishu, webhook, email, telegram
 	Enabled bool                   `json:"enabled"` // 是否启用
 	Config  map[string]interface{} `json:"config"`  // 配置对象
 }
@@ -24,6 +24,12 @@ type NotificationChannelConfig struct {
 type AutoFlymodeConfig struct {
 	Enabled          bool  `json:"enabled"`
 	IdleTimeoutHours int64 `json:"idleTimeoutHours"`
+}
+
+// SMSForwardingConfig 控制入站短信发送到所有通知渠道前的全局包装格式。
+type SMSForwardingConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Template string `json:"template"`
 }
 
 // 配置格式说明：

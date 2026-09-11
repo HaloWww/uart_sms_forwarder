@@ -113,7 +113,7 @@ export default function SerialControl() {
                 description="查看移动网络与模块状态，或执行设备控制命令。"
             />
 
-            {selectedSim?.online && !selectedSim.scriptCompatible && (
+            {selectedSim?.online && deviceStatus?.version && !selectedSim.scriptCompatible && (
                 <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
                     当前 Air780 的 main.lua 版本过旧。请升级脚本后再使用短信发送功能。
                 </div>

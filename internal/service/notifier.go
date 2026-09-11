@@ -22,12 +22,16 @@ import (
 
 // Notifier 告警通知服务
 type Notifier struct {
-	logger *zap.Logger
+	logger          *zap.Logger
+	httpClient      *http.Client
+	weComAPIBaseURL string
 }
 
 func NewNotifier(logger *zap.Logger) *Notifier {
 	return &Notifier{
-		logger: logger,
+		logger:          logger,
+		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		weComAPIBaseURL: "https://qyapi.weixin.qq.com",
 	}
 }
 
@@ -41,8 +45,11 @@ type NotificationMessage struct {
 	IMSI       string
 	IMEI       string
 	From       string
+	To         string // 入站短信接收号码
 	Content    string // 短信内容（来电时为空）
 	Timestamp  int64
+	Incoming   bool
+	Rendered   string // 已应用全局包装的最终通知正文
 }
 
 func (m NotificationMessage) identitySummary() string {
@@ -70,6 +77,9 @@ func (m NotificationMessage) identitySummary() string {
 }
 
 func (m NotificationMessage) String() string {
+	if m.Rendered != "" {
+		return m.Rendered
+	}
 	timestamp := time.Unix(m.Timestamp, 0)
 	identity := m.identitySummary()
 	switch m.Type {
@@ -110,6 +120,172 @@ func (m NotificationMessage) String() string {
 			timestamp.Format(time.DateTime),
 		)
 	}
+}
+
+type BarkResult struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (n *Notifier) sendBarkByConfig(ctx context.Context, config map[string]interface{}, message string) error {
+	serverURL, _ := config["serverUrl"].(string)
+	deviceKey, _ := config["deviceKey"].(string)
+	title, _ := config["title"].(string)
+	group, _ := config["group"].(string)
+	sound, _ := config["sound"].(string)
+	serverURL = strings.TrimRight(strings.TrimSpace(serverURL), "/")
+	deviceKey = strings.TrimSpace(deviceKey)
+	if serverURL == "" {
+		serverURL = "https://api.day.app"
+	}
+	parsedURL, err := url.Parse(serverURL)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return fmt.Errorf("Bark serverUrl 必须是有效的 HTTP(S) 地址")
+	}
+	if deviceKey == "" {
+		return fmt.Errorf("Bark 配置缺少 deviceKey")
+	}
+	if title == "" {
+		title = "UART 短信转发器"
+	}
+	body := map[string]interface{}{
+		"device_key": deviceKey,
+		"title":      title,
+		"body":       message,
+	}
+	if group != "" {
+		body["group"] = group
+	}
+	if sound != "" {
+		body["sound"] = sound
+	}
+	result, err := n.sendJSONRequest(ctx, serverURL+"/push", body)
+	if err != nil {
+		return err
+	}
+	var response BarkResult
+	if err := json.Unmarshal(result, &response); err != nil {
+		return fmt.Errorf("解析 Bark 响应失败: %w", err)
+	}
+	if response.Code != 200 {
+		return fmt.Errorf("Bark 推送失败: code=%d message=%s", response.Code, response.Message)
+	}
+	return nil
+}
+
+type weComTokenResult struct {
+	Errcode     int    `json:"errcode"`
+	Errmsg      string `json:"errmsg"`
+	AccessToken string `json:"access_token"`
+}
+
+func (n *Notifier) sendWeComAppByConfig(ctx context.Context, config map[string]interface{}, message string) error {
+	corpID, _ := config["corpId"].(string)
+	secret, _ := config["secret"].(string)
+	agentIDValue, _ := config["agentId"].(string)
+	toUser, _ := config["toUser"].(string)
+	corpID = strings.TrimSpace(corpID)
+	secret = strings.TrimSpace(secret)
+	if corpID == "" || secret == "" || strings.TrimSpace(agentIDValue) == "" {
+		return fmt.Errorf("企业微信应用配置缺少 corpId、agentId 或 secret")
+	}
+	agentID, err := strconv.Atoi(strings.TrimSpace(agentIDValue))
+	if err != nil || agentID <= 0 {
+		return fmt.Errorf("企业微信应用 agentId 必须是正整数")
+	}
+	if strings.TrimSpace(toUser) == "" {
+		toUser = "@all"
+	}
+	client, err := n.httpClientByProxyConfig(config)
+	if err != nil {
+		return fmt.Errorf("企业微信应用代理配置错误: %w", err)
+	}
+
+	tokenURL := n.weComAPIBaseURL + "/cgi-bin/gettoken?corpid=" + url.QueryEscape(corpID) +
+		"&corpsecret=" + url.QueryEscape(secret)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return fmt.Errorf("创建企业微信令牌请求失败: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("获取企业微信访问令牌失败: %w", err)
+	}
+	defer resp.Body.Close()
+	data, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("读取企业微信令牌响应失败: %w", readErr)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("获取企业微信访问令牌失败，状态码: %d", resp.StatusCode)
+	}
+	var tokenResult weComTokenResult
+	if err := json.Unmarshal(data, &tokenResult); err != nil {
+		return fmt.Errorf("解析企业微信令牌响应失败: %w", err)
+	}
+	if tokenResult.Errcode != 0 || tokenResult.AccessToken == "" {
+		return fmt.Errorf("获取企业微信访问令牌失败: %s", tokenResult.Errmsg)
+	}
+
+	body := map[string]interface{}{
+		"touser":  toUser,
+		"msgtype": "text",
+		"agentid": agentID,
+		"text": map[string]string{
+			"content": message,
+		},
+		"safe": 0,
+	}
+	result, err := n.sendJSONRequestWithClient(ctx, client, n.weComAPIBaseURL+
+		"/cgi-bin/message/send?access_token="+url.QueryEscape(tokenResult.AccessToken), body)
+	if err != nil {
+		return err
+	}
+	var sendResult WeComResult
+	if err := json.Unmarshal(result, &sendResult); err != nil {
+		return fmt.Errorf("解析企业微信应用响应失败: %w", err)
+	}
+	if sendResult.Errcode != 0 {
+		return fmt.Errorf("企业微信应用推送失败: %s", sendResult.Errmsg)
+	}
+	return nil
+}
+
+func (n *Notifier) httpClientByProxyConfig(config map[string]interface{}) (*http.Client, error) {
+	proxyEnabled, _ := config["proxyEnabled"].(bool)
+	if !proxyEnabled {
+		if n.httpClient != nil {
+			return n.httpClient, nil
+		}
+		return &http.Client{Timeout: 10 * time.Second}, nil
+	}
+	proxyURL, _ := config["proxyUrl"].(string)
+	proxyUsername, _ := config["proxyUsername"].(string)
+	proxyPassword, _ := config["proxyPassword"].(string)
+	parsedProxyURL, err := buildProxyURL(proxyURL, proxyUsername, proxyPassword)
+	if err != nil {
+		return nil, err
+	}
+	if parsedProxyURL.Scheme != "http" && parsedProxyURL.Scheme != "https" && parsedProxyURL.Scheme != "socks5" {
+		return nil, fmt.Errorf("代理地址仅支持 http、https 或 socks5")
+	}
+	if parsedProxyURL.Host == "" {
+		return nil, fmt.Errorf("代理地址缺少主机")
+	}
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(parsedProxyURL),
+		},
+	}, nil
+}
+
+func (n *Notifier) SendBarkByConfig(ctx context.Context, config map[string]interface{}, message string) error {
+	return n.sendBarkByConfig(ctx, config, message)
+}
+
+func (n *Notifier) SendWeComAppByConfig(ctx context.Context, config map[string]interface{}, message string) error {
+	return n.sendWeComAppByConfig(ctx, config, message)
 }
 
 // sendDingTalk 发送钉钉通知
@@ -295,6 +471,11 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 			v = msg.From
 		case "content":
 			v = msg.Content
+			if msg.Rendered != "" {
+				v = msg.Rendered
+			}
+		case "receiver", "to":
+			v = msg.To
 		case "type":
 			v = msg.Type
 		case "timestamp":
@@ -341,10 +522,10 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 	}
 
 	// 发送请求
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	client := n.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
-
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("发送请求失败: %w", err)
@@ -369,6 +550,16 @@ func (n *Notifier) sendCustomWebhook(ctx context.Context, config map[string]inte
 
 // sendJSONRequest 发送JSON请求
 func (n *Notifier) sendJSONRequest(ctx context.Context, url string, body interface{}) ([]byte, error) {
+	client := n.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	return n.sendJSONRequestWithClient(ctx, client, url, body)
+}
+
+func (n *Notifier) sendJSONRequestWithClient(
+	ctx context.Context, client *http.Client, url string, body interface{},
+) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求体失败: %w", err)
@@ -380,10 +571,6 @@ func (n *Notifier) sendJSONRequest(ctx context.Context, url string, body interfa
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -573,6 +760,8 @@ func (n *Notifier) sendEmail(ctx context.Context, config map[string]interface{},
 				v = msg.From
 			case "content":
 				v = msg.Content
+			case "receiver", "to":
+				v = msg.To
 			case "type":
 				v = msg.Type
 			case "timestamp":

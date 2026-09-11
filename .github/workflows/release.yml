@@ -4,29 +4,51 @@ on:
   push:
     tags:
       - 'v*'  # 当推送 v 开头的 tag 时触发，例如 v1.0.0
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布版本号，例如 v1.0.0'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # 获取完整的 git 历史，用于版本号
 
       - name: 设置 Go 环境
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
       - name: 设置 Node.js 环境
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
+
+      - name: 校验版本号
+        shell: bash
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "版本号必须符合 v1.2.3 或 v1.2.3-beta.1 格式，当前值：${RELEASE_TAG}"
+            exit 1
+          fi
 
       - name: 安装 Yarn 和 UPX
         run: |
@@ -36,15 +58,12 @@ jobs:
 
       - name: 使用 Make 构建前后端（多平台）
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
           make build-web
-          make build-servers VERSION=${VERSION}
+          make build-servers VERSION="${RELEASE_TAG}"
           ls -lh bin/
 
       - name: 准备发布包
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-
           # 定义平台和架构
           PLATFORMS=(
             "linux-amd64"
@@ -62,32 +81,44 @@ jobs:
             RELEASE_DIR="uart_sms_forwarder-${PLATFORM}"
             mkdir -p ${RELEASE_DIR}
 
-            # 复制二进制文件
+            # 复制二进制文件和运行所需文件
             if [[ $PLATFORM == windows-* ]]; then
               cp bin/uart_sms_forwarder-${PLATFORM}.exe ${RELEASE_DIR}/uart_sms_forwarder.exe
+              cp scripts/windows/start.ps1 ${RELEASE_DIR}/start.ps1
             else
               cp bin/uart_sms_forwarder-${PLATFORM} ${RELEASE_DIR}/uart_sms_forwarder
             fi
 
-            # 复制配置文件示例
+            # 复制配置文件和设备脚本
             cp config.example.yaml ${RELEASE_DIR}/config.yaml
+            cp main.lua ${RELEASE_DIR}/main.lua
 
-            # 打包为 tar.gz
-            tar -czf ${RELEASE_DIR}.tar.gz ${RELEASE_DIR}
+            # Windows 使用资源管理器可直接解压的 zip，其他平台使用 tar.gz
+            if [[ $PLATFORM == windows-* ]]; then
+              zip -rq ${RELEASE_DIR}.zip ${RELEASE_DIR}
+            else
+              tar -czf ${RELEASE_DIR}.tar.gz ${RELEASE_DIR}
+            fi
 
             echo "✓ Packaged ${PLATFORM}"
           done
 
           # 显示所有打包结果
-          ls -lh uart_sms_forwarder-*.tar.gz
+          ls -lh uart_sms_forwarder-*.tar.gz uart_sms_forwarder-*.zip
+
+      - name: 生成 SHA-256 校验和
+        run: sha256sum uart_sms_forwarder-*.tar.gz uart_sms_forwarder-*.zip > SHA256SUMS
 
       - name: 创建 Release 并上传文件
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
           files: |
             uart_sms_forwarder-*.tar.gz
+            uart_sms_forwarder-*.zip
+            SHA256SUMS
+          fail_on_unmatched_files: true
           draft: false
           prerelease: false
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
