@@ -12,6 +12,7 @@ import {cn} from '@/lib/utils';
 import {useSim} from '@/providers/SimContext';
 import {getErrorMessage, isAssignableSim} from '@/lib/sim';
 import {DeviceForwardingSettings} from '@/components/DeviceForwardingSettings';
+import {formatServingNetwork} from '@/lib/mobile-network';
 
 interface InfoRowProps {
     label: string;
@@ -23,7 +24,7 @@ function InfoRow({label, value, mono = false}: InfoRowProps) {
     return (
         <div className="flex min-w-0 items-center justify-between gap-4 border-b border-slate-100 py-2.5 last:border-b-0">
             <dt className="shrink-0 text-xs font-medium text-slate-500">{label}</dt>
-            <dd className={cn('min-w-0 truncate text-right text-xs font-semibold text-slate-800', mono && 'font-mono')}>
+            <dd className={cn('min-w-0 truncate text-right text-xs font-semibold text-slate-800', mono && 'font-mono')} title={typeof value === 'string' ? value : undefined}>
                 {value}
             </dd>
         </div>
@@ -92,6 +93,7 @@ export default function SerialControl() {
     const mobile = deviceStatus?.mobile;
     const directForward = deviceStatus?.direct_forward;
     const connected = Boolean(selectedSim?.online && !selectedSim.conflict && deviceStatus?.connected);
+    const registered = Boolean(connected && !deviceStatus?.flymode && mobile?.is_registered);
     const controlReady = Boolean(
         connected && selectedSim && isAssignableSim(selectedSim) && selectedSimId &&
         selectedSim.scriptCompatible && selectedSim.sendReady,
@@ -100,11 +102,12 @@ export default function SerialControl() {
         controlReady && deviceStatus?.identity_valid && deviceStatus.sim_id === selectedSimId,
     );
     const unavailable = '—';
+    const servingNetwork = formatServingNetwork(mobile, connected, deviceStatus?.flymode);
     const displaySignal = (value?: number, unit = '') => connected && value ? `${value}${unit}` : unavailable;
     const registrationText = !connected
         ? unavailable
-        : mobile?.is_registered
-            ? mobile.is_roaming ? '已注册 · 漫游' : '已注册'
+        : registered
+            ? mobile?.is_roaming ? '已注册 · 漫游' : '已注册'
             : '未注册';
 
     const signalMetrics = [
@@ -167,10 +170,10 @@ export default function SerialControl() {
                                     <StatusTile
                                         label="网络注册"
                                         value={registrationText}
-                                        tone={connected && mobile?.is_registered ? 'blue' : 'slate'}
+                                        tone={registered ? 'blue' : 'slate'}
                                     />
                                     <StatusTile
-                                        label="运营商"
+                                        label="卡片归属运营商"
                                         value={connected ? mobile?.operator || unavailable : unavailable}
                                         tone={connected ? 'blue' : 'slate'}
                                     />
@@ -180,6 +183,10 @@ export default function SerialControl() {
                                         tone={connected && deviceStatus?.flymode ? 'amber' : connected ? 'green' : 'slate'}
                                     />
                                 </div>
+
+                                <dl className="mt-3 rounded-lg border border-slate-100 px-3.5">
+                                    <InfoRow label="当前驻留网络" value={servingNetwork}/>
+                                </dl>
 
                                 <section className="mt-5">
                                     <div className="mb-2.5 flex items-center justify-between">

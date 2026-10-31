@@ -7,6 +7,7 @@ import {StatCard} from '@/components/StatsCard.tsx';
 import {cn} from '@/lib/utils.ts';
 import {PageHeader} from '@/components/PageHeader';
 import {useSim} from '@/providers/SimContext';
+import {formatServingNetwork} from '@/lib/mobile-network';
 
 const describeSignal = (rsrp?: number) => {
     if (!rsrp) return '等待数据';
@@ -31,6 +32,7 @@ export default function Dashboard() {
 
     const mobile = deviceStatus?.mobile;
     const connected = Boolean(deviceStatus?.connected);
+    const registered = Boolean(connected && !deviceStatus?.flymode && mobile?.is_registered);
     const canSend = Boolean(
         selectedSim?.online && selectedSim.scriptCompatible && selectedSim.sendReady && !selectedSim.conflict,
     );
@@ -39,12 +41,14 @@ export default function Dashboard() {
         : 0;
     const signalDescription = connected ? describeSignal(mobile?.rsrp) : '等待设备连接';
     const unavailable = '—';
+    const servingNetwork = formatServingNetwork(mobile, connected, deviceStatus?.flymode);
 
     const deviceDetails = [
         {label: '串口设备', value: connected ? deviceStatus?.port_name || unavailable : unavailable},
         {label: '固件版本', value: connected ? deviceStatus?.version || unavailable : unavailable},
         {label: 'SIM 卡', value: connected ? mobile?.sim_ready ? '已就绪' : '未就绪' : unavailable},
-        {label: '网络注册', value: connected ? mobile?.is_registered ? '已注册' : '未注册' : unavailable},
+        {label: '卡片归属运营商', value: connected ? mobile?.operator || unavailable : unavailable},
+        {label: '网络注册', value: connected ? registered ? mobile?.is_roaming ? '已注册 · 漫游' : '已注册' : '未注册' : unavailable},
         {label: '飞行模式', value: connected ? deviceStatus?.flymode ? '已开启' : '已关闭' : unavailable},
         {label: '运行内存', value: connected && deviceStatus?.mem_kb ? `${deviceStatus.mem_kb.toFixed(1)} KB` : unavailable},
     ];
@@ -130,14 +134,14 @@ export default function Dashboard() {
                             </span>
                             <div>
                                 <h2 className="text-sm font-bold text-slate-900">移动网络与设备</h2>
-                                <p className="text-xs text-slate-400">{connected ? mobile?.operator || '等待运营商信息' : '设备当前未连接'}</p>
+                                <p className="text-xs text-slate-400">蜂窝网络与模块状态</p>
                             </div>
                         </div>
                         <span className={cn(
                             'rounded-full px-2.5 py-1 text-[11px] font-semibold',
-                            connected && mobile?.is_registered ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-500',
+                            registered ? 'bg-blue-50 text-blue-700' : 'bg-slate-100 text-slate-500',
                         )}>
-                            {connected && mobile?.is_registered ? '网络已注册' : '未注册'}
+                            {registered ? mobile?.is_roaming ? '漫游已注册' : '网络已注册' : '未注册'}
                         </span>
                     </div>
 
@@ -175,8 +179,12 @@ export default function Dashboard() {
                         </div>
 
                         <dl className="grid content-start grid-cols-2 gap-x-6">
+                            <div className="col-span-2 min-w-0 border-b border-slate-100 pb-2.5">
+                                <dt className="text-[11px] font-medium text-slate-400">当前驻留网络</dt>
+                                <dd className="mt-1 break-words text-xs font-semibold text-slate-800">{servingNetwork}</dd>
+                            </div>
                             {deviceDetails.map((item) => (
-                                <div key={item.label} className="min-w-0 border-b border-slate-100 py-2.5 first:pt-0 [&:nth-child(2)]:pt-0">
+                                <div key={item.label} className="min-w-0 border-b border-slate-100 py-2.5">
                                     <dt className="text-[11px] font-medium text-slate-400">{item.label}</dt>
                                     <dd className="mt-1 truncate font-mono text-xs font-semibold text-slate-800">{item.value}</dd>
                                 </div>

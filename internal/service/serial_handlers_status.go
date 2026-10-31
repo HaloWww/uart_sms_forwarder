@@ -28,22 +28,26 @@ type StatusData struct {
 	ForwardConfigPersisted  bool               `json:"forward_config_persisted"`
 	DirectForward           DirectForwardStats `json:"direct_forward"`
 	Mobile                  struct {
-		IsRegistered bool    `json:"is_registered"`
-		IsRoaming    bool    `json:"is_roaming"`
-		Flymode      bool    `json:"flymode"`
-		Iccid        string  `json:"iccid"`
-		Imei         string  `json:"imei"`
-		SignalDesc   string  `json:"signal_desc"`
-		SignalLevel  int     `json:"signal_level"`
-		SimReady     bool    `json:"sim_ready"`
-		Rssi         int     `json:"rssi"`
-		Csq          int     `json:"csq"`      // CSQ 信号强度 (0-31)
-		Rsrp         int     `json:"rsrp"`     // 参考信号接收功率 (-44 到 -140)
-		Rsrq         float64 `json:"rsrq"`     // 参考信号发送功率 (-3 到 -19.5)
-		Imsi         string  `json:"imsi"`     // SIM 卡 IMSI
-		Number       string  `json:"number"`   // 手机号
-		Operator     string  `json:"operator"` // 运营商名称
-		Uptime       int64   `json:"uptime"`   // 模块开机时长，单位为秒
+		IsRegistered            bool    `json:"is_registered"`
+		IsRoaming               bool    `json:"is_roaming"`
+		Flymode                 bool    `json:"flymode"`
+		Iccid                   string  `json:"iccid"`
+		Imei                    string  `json:"imei"`
+		SignalDesc              string  `json:"signal_desc"`
+		SignalLevel             int     `json:"signal_level"`
+		SimReady                bool    `json:"sim_ready"`
+		Rssi                    int     `json:"rssi"`
+		Csq                     int     `json:"csq"`      // CSQ 信号强度 (0-31)
+		Rsrp                    int     `json:"rsrp"`     // 参考信号接收功率 (-44 到 -140)
+		Rsrq                    float64 `json:"rsrq"`     // 参考信号发送功率 (-3 到 -19.5)
+		Imsi                    string  `json:"imsi"`     // SIM 卡 IMSI
+		Number                  string  `json:"number"`   // 手机号
+		Operator                string  `json:"operator"` // 运营商名称
+		ServingNetworkSupported bool    `json:"serving_network_supported"`
+		ServingMCC              *int    `json:"serving_mcc,omitempty"`
+		ServingMNC              *int    `json:"serving_mnc,omitempty"`
+		ServingOperator         string  `json:"serving_operator"`
+		Uptime                  int64   `json:"uptime"` // 模块开机时长，单位为秒
 	} `json:"mobile"`
 	Timestamp   int64  `json:"timestamp"`
 	MemKb       int    `json:"mem_kb"`
@@ -110,6 +114,7 @@ func (s *SerialService) handleStatusResponse(msg *ParsedMessage) {
 			return plmn
 		}()
 	}
+	normalizeServingNetwork(&statusData)
 	// 解析期间如果发生断线、重启或 SIM 变化，此回包属于上一代状态，不能入缓存。
 	s.statusMu.Lock()
 	if !s.statusAccepting.Load() || statusEpoch != s.statusEpoch.Load() {

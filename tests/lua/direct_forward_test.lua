@@ -522,7 +522,8 @@ local function load_main(configuration, config_error, options)
     local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {},
         storage = options.storage or {}, http_calls = {}, time = 100, tx = 0, rx = 0,
         fail_set = options.fail_set, fail_get = options.fail_get, storage_broken = options.storage_broken,
-        readback_mismatch = options.readback_mismatch, current_iccid = message().iccid}
+        readback_mismatch = options.readback_mismatch, current_iccid = message().iccid,
+        network_status = 1, current_imsi = "460001234567890", cell_info = {mcc = 460, mnc = 0}}
     local sandbox = setmetatable({}, {__index = _G})
     local noop = function() end
     local sys = {
@@ -542,9 +543,14 @@ local function load_main(configuration, config_error, options)
     sandbox.mobile = {
         apn = noop, setAuto = noop, simid = function() return 0 end,
         simPin = function() return true end, iccid = function() return message().iccid end,
-        imsi = function() return "460001234567890" end, number = function() return "13800138000" end,
+        imsi = function() return env.current_imsi end, number = function() return "13800138000" end,
         imei = function() return "123456789012345" end, muid = function() return "module-identity" end,
-        status = function() return 1 end, csq = function() return 25 end,
+        status = function() return env.network_status end, csq = function() return 25 end,
+        scell = function()
+            if env.cell_error then error("simulated cell query failure") end
+            if env.cell_hook then env.cell_hook() end
+            return copy(env.cell_info)
+        end,
         rssi = function() return -70 end, rsrp = function() return -90 end, rsrq = function() return -10 end,
         flymode = function(slot, enabled)
             env.fly_calls[#env.fly_calls + 1] = {slot = slot, enabled = enabled}
@@ -648,7 +654,90 @@ local function load_main(configuration, config_error, options)
         assert(reply, "missing response for " .. action)
         return reply
     end
+    function env:status()
+        self.sandbox.process_uart_command({action = "get_status"})
+        self:flush_uart()
+        return assert(self:last_frame("status_response"))
+    end
     return env
+end
+
+function tests.main_serving_network_uses_current_cell_not_home_imsi()
+    local env = load_main({mode = "uart"})
+    env.current_imsi = "454001234567890"
+    env.network_status = 5
+    env:resume_tasks(3)
+    local info = env:status().mobile
+    equal(info.imsi, env.current_imsi)
+    equal(info.is_registered, true)
+    equal(info.is_roaming, true)
+    equal(info.serving_network_supported, true)
+    equal(info.serving_mcc, 460)
+    equal(info.serving_mnc, 0)
+    env.cell_info = {mcc = 310, mnc = 260}
+    info = env:status().mobile
+    equal(info.serving_mcc, 310)
+    equal(info.serving_mnc, 260)
+end
+
+function tests.main_serving_network_clears_for_unregistered_and_supports_sms_only()
+    local env = load_main({mode = "uart"})
+    env:resume_tasks(3)
+    equal(env:status().mobile.serving_mcc, 460)
+    for _, state in ipairs({0, 2, 3, 4}) do
+        env.network_status = state
+        local info = env:status().mobile
+        equal(info.is_registered, false)
+        equal(info.serving_mcc, nil)
+        equal(info.serving_mnc, nil)
+    end
+    for _, state in ipairs({6, 7}) do
+        env.network_status = state
+        local info = env:status().mobile
+        equal(info.is_registered, true)
+        equal(info.is_roaming, state == 7)
+        equal(info.serving_mcc, 460)
+    end
+end
+
+function tests.main_serving_network_clears_on_missing_failed_or_invalid_cell_query()
+    local env = load_main({mode = "uart"})
+    env:resume_tasks(3)
+    equal(env:status().mobile.serving_mcc, 460)
+    for _, cell in ipairs({{}, {mcc = 0, mnc = 0}, {mcc = 460},
+        {mcc = 460, mnc = -1}, {mcc = 460, mnc = 1000},
+        {mcc = 460.5, mnc = 0}, {mcc = 460, mnc = 0.5}, {mcc = "460", mnc = 0}}) do
+        env.cell_info = cell
+        local info = env:status().mobile
+        equal(info.serving_network_supported, true)
+        equal(info.serving_mcc, nil)
+        equal(info.serving_mnc, nil)
+    end
+    env.cell_error = true
+    equal(env:status().mobile.serving_mcc, nil)
+    env.sandbox.mobile.scell = nil
+    local legacy = env:status().mobile
+    equal(legacy.serving_network_supported, false)
+    equal(legacy.serving_mcc, nil)
+end
+
+function tests.main_serving_network_is_not_reported_across_sim_or_registration_change()
+    local env = load_main({mode = "uart"})
+    env:resume_tasks(3)
+    env.cell_hook = function() env.current_iccid = "8986000000000000002" end
+    equal(env:status().mobile.serving_mcc, nil)
+    env = load_main({mode = "uart"})
+    env:resume_tasks(3)
+    env.cell_hook = function() env.network_status = 2 end
+    equal(env:status().mobile.serving_mcc, nil)
+    env = load_main({mode = "uart"})
+    env:resume_tasks(3)
+    env.sandbox.process_uart_command({action = "set_flymode", enabled = true,
+        source = "manual", expected_iccid = message().iccid})
+    env:flush_uart()
+    equal(env:status().mobile.serving_mcc, nil)
+    env.events.SIM_IND("NORDY")
+    equal(env:status().mobile.serving_mcc, nil)
 end
 
 function tests.main_uart_default_does_not_import_direct_network_engine()

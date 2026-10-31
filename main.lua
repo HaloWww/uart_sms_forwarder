@@ -1,14 +1,14 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.6.0
+-- VERSION: 1.6.1
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 log.info("main", PROJECT, VERSION)
 
@@ -431,7 +431,7 @@ end
 
 local function get_mobile_info()
     local info = copy_identity(active_identity)
-    -- 使用 status 判断：0=未注册 1=已注册 2=搜索中 3=拒绝 5=漫游注册
+    -- 注册状态包含仅短信可用的网络；是否支持数据业务由转发引擎单独判断。
     local net_stat = mobile.status()
 
     -- 获取信号强度指标
@@ -450,8 +450,27 @@ local function get_mobile_info()
         info.signal_desc = csq >= 20 and "强" or (csq >= 10 and "中" or "弱")
     end
 
-    info.is_registered = (net_stat == 1 or net_stat == 5)
-    info.is_roaming = net_stat == 5
+    info.is_registered = (net_stat == 1 or net_stat == 5 or net_stat == 6 or net_stat == 7)
+    info.is_roaming = (net_stat == 5 or net_stat == 7)
+    -- scell 是当前服务小区，getCellInfo 还包含邻区，不能用邻区推断驻留网络。
+    -- scell 的 MCC/MNC 已由底层转换为十进制；MNC=0 也是有效网络。
+    info.serving_network_supported = type(mobile.scell) == "function"
+    if info.serving_network_supported and info.is_registered and
+       info.sim_ready and info.identity_valid and not flymode_requested then
+        local before = read_identity_candidate()
+        if stable_identity_equal(info, before) then
+            local cell = safe_mobile_call(mobile.scell)
+            local after = read_identity_candidate()
+            if type(cell) == "table" and stable_identity_equal(before, after) and
+               type(cell.mcc) == "number" and cell.mcc >= 1 and cell.mcc <= 999 and
+               cell.mcc == math.floor(cell.mcc) and
+               type(cell.mnc) == "number" and cell.mnc >= 0 and cell.mnc <= 999 and
+               cell.mnc == math.floor(cell.mnc) and mobile.status() == net_stat then
+                info.serving_mcc = cell.mcc
+                info.serving_mnc = cell.mnc
+            end
+        end
+    end
     info.uptime = mcu.ticks2() -- 单位为秒
 
     -- mobile.flymode() 在部分固件查询不准确，优先使用本脚本记录的请求状态。

@@ -65,7 +65,11 @@ export interface MobileInfo {
     signal_desc: string;         // 信号描述 (强/中/弱/无信号)
     is_registered: boolean;      // 是否已注册网络
     is_roaming: boolean;         // 是否漫游
-    operator: string;            // 运营商英文简称
+    operator: string;            // SIM 卡归属运营商，由 IMSI 识别
+    serving_network_supported?: boolean;
+    serving_mcc?: number;
+    serving_mnc?: number;
+    serving_operator?: string;   // 当前驻留网络，不能从 SIM 归属推断
     csq: number;
     rsrp: number;
     rsrq: number;
