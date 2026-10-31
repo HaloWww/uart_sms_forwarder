@@ -33,7 +33,7 @@ func testForwardingManager(t *testing.T) (*SerialManager, *SerialService, *captu
 	port := &capturingSerialPort{}
 	s.installSerialPort(port)
 	s.setConnected(true)
-	s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.7.0","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986001"}}`})
+	s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.7.1","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986001"}}`})
 	return m, s, port
 }
 
@@ -123,7 +123,7 @@ func TestForwardingConfigDoesNotReportSuccessForUnpersistedOrDifferentReadback(t
 					!(scenario == "readback_not_persisted" && cmd["action"] == "get_forward_config")
 				actual := wanted
 				if scenario == "readback_changed" {
-					actual.Mode = "uart"
+					actual.Template += " changed"
 				}
 				testForwardingResponse(s, cmd, "ok", boundTestForwardingPayload(actual, persisted))
 			}
@@ -143,7 +143,7 @@ func TestForwardingConfigRejectsOldFirmwareAndChangedSIMBeforeWire(t *testing.T)
 			}
 			expected := SIMIdentity{SIMID: "iccid:8986001", ICCID: "8986001", Verified: true}
 			if scenario == "sim_changed" {
-				s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.7.0","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986002"}}`})
+				s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.7.1","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986002"}}`})
 			}
 			_, err := s.forwardingConfig(context.Background(), expected, nil)
 			if err == nil {

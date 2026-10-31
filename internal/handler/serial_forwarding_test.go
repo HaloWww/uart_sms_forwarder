@@ -91,3 +91,16 @@ func TestForwardingBindingLimitHTTPError(t *testing.T) {
 		t.Fatalf("missing actionable binding limit error: %d %s", response.Code, response.Body.String())
 	}
 }
+
+func TestForwardingProtocolHTTPErrorRequiresDirectOnlyBindingVersion(t *testing.T) {
+	e := echo.New()
+	response := httptest.NewRecorder()
+	ctx := e.NewContext(httptest.NewRequest(http.MethodPut, "/api/serial/forwarding", nil), response)
+	if err := writeForwardingConfigError(ctx, service.ErrSIMProtocolOutdated); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "1.7.1") ||
+		!strings.Contains(response.Body.String(), "lua_script_outdated") {
+		t.Fatalf("wrong direct-only binding upgrade requirement: %d %s", response.Code, response.Body.String())
+	}
+}

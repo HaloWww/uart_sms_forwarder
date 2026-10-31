@@ -22,7 +22,8 @@ const CHANNEL_NAMES: Record<ForwardingChannelType, string> = {
 function supportsBoardSettings(version = '') {
     const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
     if (!match) return false;
-    return Number(match[1]) > 1 || (Number(match[1]) === 1 && Number(match[2]) >= 7);
+    const [, major, minor, patch] = match.map(Number);
+    return major > 1 || (major === 1 && (minor > 7 || (minor === 7 && patch >= 1)));
 }
 
 function bindingLabel(binding: {iccid: string; number?: string}) {
@@ -35,7 +36,7 @@ function defaultChannel(type: ForwardingChannelType, id: string = type): Forward
     return {id, type, enabled: false, url: ''};
 }
 
-function normalizeConfig(config: ForwardingConfig): ForwardingConfig {
+function normalizeConfig(config: Partial<ForwardingConfig>): ForwardingConfig {
     return {
         mode: config.mode === 'direct' ? 'direct' : 'uart',
         apn: config.apn ?? '',
@@ -61,6 +62,7 @@ function usesHttps(value = '') {
 }
 
 function validateConfig(config: ForwardingConfig): string | null {
+    if (config.mode === 'uart') return null;
     if (config.mode === 'direct' && !config.channels.some((channel) => channel.enabled)) {
         return '请至少启用一个板载通知渠道。';
     }
@@ -107,21 +109,25 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
     const [deleteTarget, setDeleteTarget] = useState<ForwardingBinding | null>(null);
     const [newChannelType, setNewChannelType] = useState<ForwardingChannelType>('bark');
     const dirty = JSON.stringify(config) !== confirmed;
-    const bound = savedSnapshot.persisted && savedSnapshot.sim_bound &&
+    const bound = savedSnapshot.config.mode === 'direct' && savedSnapshot.persisted && savedSnapshot.sim_bound &&
         savedSnapshot.bound_iccid === currentICCID && !savedSnapshot.legacy_unbound;
-    const bindings = savedSnapshot.bindings ?? [];
+    const bindings = (savedSnapshot.bindings ?? []).filter((binding) => binding.mode === 'direct');
     const currentBinding = bindings.find((binding) => binding.iccid === currentICCID);
     const needsConfirmation = Boolean(currentBinding && !bound);
     const bindingLimit = savedSnapshot.binding_limit || 4;
-    const atCapacity = !currentBinding && bindings.length >= bindingLimit;
+    const atCapacity = config.mode === 'direct' && !currentBinding && bindings.length >= bindingLimit;
     const currentLabel = bindingLabel({iccid: currentICCID, number: bound ? savedSnapshot.bound_number || number : number});
     const saveMutation = useMutation({
         mutationFn: async (submitted: ForwardingConfig) => {
             const validationError = validateConfig(submitted);
             if (validationError) throw new Error(validationError);
-            const response = await saveForwardingConfig(simId, submitted);
-            if (!response.persisted || !response.sim_bound || response.bound_iccid !== currentICCID || response.legacy_unbound) {
-                throw new Error('板子没有确认当前 SIM 的绑定已持久保存，请重新读取后核对。');
+            const response = await saveForwardingConfig(simId, submitted.mode === 'uart' ? normalizeConfig({mode: 'uart'}) : submitted);
+            const confirmedDirect = response.config.mode === 'direct' && response.persisted && response.sim_bound &&
+                response.bound_iccid === currentICCID && !response.legacy_unbound;
+            const confirmedHost = response.config.mode === 'uart' && !response.persisted && !response.sim_bound &&
+                Array.isArray(response.bindings) && !response.bindings.some((binding) => binding.iccid === currentICCID);
+            if (submitted.mode === 'direct' ? !confirmedDirect : !confirmedHost) {
+                throw new Error(submitted.mode === 'direct' ? '板子没有确认当前 SIM 的流量转发记录已持久保存，请重新读取后核对。' : '板子没有确认已恢复默认主机转发并清除该 SIM 的流量转发记录，请重新读取后核对。');
             }
             return response;
         },
@@ -131,7 +137,7 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
             setConfirmed(JSON.stringify(saved));
             setSavedSnapshot(response);
             onSaved(response);
-            toast.success(saved.mode === 'direct' ? `${currentLabel} 已绑定流量转发，关闭 exe 后仍生效` : `${currentLabel} 已绑定主机转发`);
+            toast.success(saved.mode === 'direct' ? `${currentLabel} 的流量转发设置已记住，关闭 exe 后仍生效` : currentBinding ? `${currentLabel} 已恢复主机转发，流量转发记录已清除` : `${currentLabel} 使用默认主机转发，无需记录`);
             await queryClient.invalidateQueries({queryKey: ['sims']});
         },
     });
@@ -139,8 +145,8 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
         mutationFn: async (iccid: string) => {
             const response = await deleteForwardingBinding(simId, iccid);
             if (!Array.isArray(response.bindings) || response.bindings.some((binding) => binding.iccid === iccid) ||
-                (iccid === currentICCID && (response.sim_bound || response.config.mode !== 'uart'))) {
-                throw new Error('板子没有确认绑定已删除，请重新读取后核对。');
+                (iccid === currentICCID && (response.sim_bound || response.persisted || response.config.mode !== 'uart'))) {
+                throw new Error('板子没有确认流量转发记录已清除，请重新读取后核对。');
             }
             return response;
         },
@@ -152,7 +158,7 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
             setSavedSnapshot(response);
             setDeleteTarget(null);
             onSaved(response);
-            toast.success(iccid === currentICCID ? `${label} 的绑定已删除，该 SIM 已恢复主机转发` : `${label} 的绑定已删除，存储位置已释放`);
+            toast.success(iccid === currentICCID ? `${label} 的流量转发记录已清除，该 SIM 已恢复默认主机转发` : `${label} 的流量转发记录已清除，存储位置已释放`);
             await queryClient.invalidateQueries({queryKey: ['sims']});
         },
     });
@@ -172,14 +178,14 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
     };
     return <div className="space-y-5">
         <div className={`rounded-lg px-3.5 py-3 text-xs leading-5 ${dirty || savedSnapshot.legacy_unbound || needsConfirmation ? 'bg-amber-50 text-amber-800' : bound ? 'bg-emerald-50 text-emerald-800' : 'bg-slate-50 text-slate-600'}`} role="status">
-            <p className="font-semibold">{currentLabel} · {bound ? '已绑定' : needsConfirmation ? '待重新确认' : '未绑定'}</p>
+            <p className="font-semibold">{currentLabel} · {bound ? '已记住流量转发' : needsConfirmation ? '流量转发待确认' : '默认主机转发，无需记录'}</p>
             <p>{savedSnapshot.legacy_unbound
-                ? '检测到旧版未绑定 SIM 的配置，当前不会自动使用。请核对本页设置，再明确保存到当前 SIM。'
+                ? '检测到旧版未绑定 SIM 的配置，当前不会自动使用。请重新确认流量转发设置并保存，或选择默认主机转发。'
                 : bound
-                    ? '已按 ICCID 保存在当前板子中。拔出此卡后不会用于其他卡，插回此卡会自动恢复。'
+                    ? '此卡的流量转发已按 ICCID 保存在当前板子中。拔出此卡后不会用于其他卡，插回此卡会自动恢复。'
                     : needsConfirmation
                         ? '此 ICCID 有旧的保存记录，但当前未通过 SIM 核对，正在使用主机转发。请核对并重新保存以更新绑定，不占用新的存储位置。'
-                        : '当前 SIM 尚未保存专属设置，默认使用主机转发。保存后只绑定当前 SIM。'}</p>
+                        : '当前 SIM 使用主机转发，不占用存储位置。只有需要 SIM 流量独立转发的卡才保存记录。'}</p>
             {dirty && <p className="mt-1">有未保存修改，尚未改变板子当前的转发方式。</p>}
         </div>
         <fieldset disabled={disabled} className="min-w-0 space-y-5 disabled:opacity-60">
@@ -187,14 +193,15 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
                 <Field id={`${fieldId}-mode`} label="转发方式">
                     <Select value={config.mode} onValueChange={(value) => update('mode', value as ForwardingConfig['mode'])}>
                         <SelectTrigger id={`${fieldId}-mode`} className="w-full"><SelectValue/></SelectTrigger>
-                        <SelectContent><SelectItem value="uart">主机转发</SelectItem><SelectItem value="direct">SIM 流量独立转发</SelectItem></SelectContent>
+                        <SelectContent><SelectItem value="uart">主机转发（默认，无需记录）</SelectItem><SelectItem value="direct">SIM 流量独立转发</SelectItem></SelectContent>
                     </Select>
                 </Field>
-                <Field id={`${fieldId}-apn`} label="SIM 数据 APN" hint="普通手机卡留空；专网卡按运营商要求填写。修改后如未联网，请重启模块。">
+                {config.mode === 'direct' && <Field id={`${fieldId}-apn`} label="SIM 数据 APN" hint="普通手机卡留空；专网卡按运营商要求填写。修改后如未联网，请重启模块。">
                     <Input id={`${fieldId}-apn`} value={config.apn} onChange={(event) => update('apn', event.target.value)} placeholder="使用运营商默认 APN"/>
-                </Field>
+                </Field>}
             </div>
-            <p className="text-xs leading-5 text-slate-500">流量转发使用此 SIM 专属的下方渠道；主机转发使用“通知渠道”页面的全局配置。只有点击保存才会修改当前 SIM 的绑定。</p>
+            <p className="text-xs leading-5 text-slate-500">{config.mode === 'direct' ? '流量转发使用此 SIM 专属的下方渠道，保存后会记住当前卡。主机转发使用“通知渠道”页面的全局配置。' : '默认主机转发，无需记录；渠道和短信格式在“通知渠道”页面设置。点击下方按钮会清除此 SIM 已保存的流量转发记录，板载渠道、APN 和模板不会保存为主机配置。'}</p>
+            {config.mode === 'direct' && <>
             <div className="space-y-3">
                 {config.channels.map((channel, index) => <section key={`${channel.id}-${index}`} className="min-w-0 rounded-xl border border-slate-200 p-4">
                     <div className="mb-3 flex items-center justify-between gap-3">
@@ -259,12 +266,13 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
                 </div>
                 <p className="mt-2 text-xs leading-5 text-slate-500">失败时指数退避，断网或飞行模式期间不消耗尝试次数。只启用需要的渠道、保持简短模板可以减少流量。</p>
             </details>
+            </>}
         </fieldset>
         {saveMutation.isError && <p role="alert" className="rounded-lg bg-rose-50 px-3.5 py-3 text-xs leading-5 text-rose-700">{getErrorMessage(saveMutation.error, '保存失败，请重新读取板子配置后核对。')}</p>}
-        {atCapacity && <p className="rounded-lg bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-800">已保存 {bindings.length} / {bindingLimit} 个 SIM 绑定。请先在下方删除不再使用的绑定，再保存当前 SIM；已有绑定不会自动被覆盖。</p>}
+        {atCapacity && <p className="rounded-lg bg-amber-50 px-3.5 py-3 text-xs leading-5 text-amber-800">已记住 {bindings.length} / {bindingLimit} 个 SIM 的流量转发设置。请先在下方清除不再使用的记录，再记住当前 SIM；也可直接选择不占存储位置的主机转发。</p>}
         <div className="flex flex-wrap gap-2 border-t border-slate-100 pt-4">
             <Button type="button" disabled={disabled || atCapacity} onClick={() => saveMutation.mutate(config)} className="bg-blue-600 text-white hover:bg-blue-700">
-                {saveMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Save className="size-4"/>}保存当前 SIM 设置
+                {saveMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Save className="size-4"/>}{config.mode === 'direct' ? '记住当前 SIM 的流量转发设置' : currentBinding ? '使用主机转发并清除记录' : '使用主机转发（无需记录）'}
             </Button>
             <Button type="button" variant="outline" disabled={disabled} onClick={onReload} title={dirty ? '重新读取会放弃未保存的修改' : '重新读取板子实际保存的配置'}>
                 <RefreshCw className={`size-4 ${reading ? 'animate-spin' : ''}`}/>重新读取{dirty ? '（放弃修改）' : ''}
@@ -272,34 +280,34 @@ function ForwardingEditor({simId, number, snapshot, ready, reading, onReload, on
         </div>
         <section className="space-y-2 border-t border-slate-100 pt-4">
             <div className="flex items-center justify-between gap-3">
-                <h3 className="text-xs font-semibold text-slate-800">此板已保存的 SIM 绑定</h3>
+                <h3 className="text-xs font-semibold text-slate-800">记住流量转发的号码</h3>
                 <span className="text-xs text-slate-500">{bindings.length} / {bindingLimit}</span>
             </div>
-            {bindings.length === 0 ? <p className="text-xs leading-5 text-slate-500">暂无绑定。换入未绑定的卡时，板子会使用主机转发。</p> : <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 px-3.5">
+            {bindings.length === 0 ? <p className="text-xs leading-5 text-slate-500">暂无流量转发记录，未记录的卡默认使用主机转发。</p> : <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 px-3.5">
                 {bindings.map((binding) => <li key={binding.iccid} className="flex flex-wrap items-center justify-between gap-2 py-2.5">
                     <div className="min-w-0">
                         <p className="text-xs font-semibold text-slate-800">{bindingLabel(binding)}{binding.iccid === currentICCID && <span className={`ml-2 font-normal ${bound ? 'text-blue-600' : 'text-amber-700'}`}>{bound ? '当前 SIM' : '当前 ICCID · 待确认'}</span>}</p>
-                        <p className="mt-0.5 text-[11px] text-slate-500">ICCID •{binding.iccid.slice(-6)} · {binding.mode === 'direct' ? 'SIM 流量转发' : '主机转发'}{binding.iccid === currentICCID && !bound ? '（已停用）' : ''}</p>
+                        <p className="mt-0.5 text-[11px] text-slate-500">ICCID •{binding.iccid.slice(-6)} · SIM 流量转发{binding.iccid === currentICCID && !bound ? '（已停用）' : ''}</p>
                     </div>
-                    <Button type="button" variant="ghost" size="sm" disabled={disabled} aria-label={`删除 ${bindingLabel(binding)} 的转发绑定`} className="text-rose-600 hover:bg-rose-50 hover:text-rose-700" onClick={() => {
+                    <Button type="button" variant="ghost" size="sm" disabled={disabled} aria-label={`清除 ${bindingLabel(binding)} 的流量转发记录`} className="text-rose-600 hover:bg-rose-50 hover:text-rose-700" onClick={() => {
                         deleteMutation.reset();
                         setDeleteTarget(binding);
-                    }}><Trash2 className="size-3.5"/>删除绑定</Button>
+                    }}><Trash2 className="size-3.5"/>清除记录</Button>
                 </li>)}
             </ul>}
-            <p className="text-xs leading-5 text-slate-500">号码仅辅助识别，实际按 ICCID 绑定；同一板子最多保存 {bindingLimit} 个 SIM 的设置。</p>
+            <p className="text-xs leading-5 text-slate-500">号码仅辅助识别，实际按 ICCID 记住；同一板子最多保存 {bindingLimit} 个 SIM 的流量转发设置，主机模式不占位置。</p>
         </section>
         <Dialog open={deleteTarget !== null} onOpenChange={(open) => {if (!open && !deleteMutation.isPending) setDeleteTarget(null);}}>
             <DialogContent showCloseButton={!deleteMutation.isPending}>
                 <DialogHeader>
-                    <DialogTitle>删除此 SIM 的转发绑定？</DialogTitle>
-                    <DialogDescription>{deleteTarget && bindingLabel(deleteTarget)} 的已保存转发设置将被移除并释放一个存储位置。{deleteTarget?.iccid === currentICCID ? '当前 SIM 会立即恢复主机转发。' : '当前 SIM 的已保存设置不受影响。'}</DialogDescription>
+                    <DialogTitle>清除此 SIM 的流量转发记录？</DialogTitle>
+                    <DialogDescription>{deleteTarget && bindingLabel(deleteTarget)} 的流量转发设置将被忘记并释放一个存储位置，此卡以后默认使用主机转发。{deleteTarget?.iccid === currentICCID ? '当前 SIM 会立即恢复默认主机转发。' : '当前 SIM 的已保存设置不受影响。'}</DialogDescription>
                 </DialogHeader>
                 {dirty && <p className="text-xs leading-5 text-amber-700">删除后将重新读取板子配置，当前表单中未保存的修改会被放弃。</p>}
                 {deleteMutation.isError && <p role="alert" className="text-xs leading-5 text-rose-700">{getErrorMessage(deleteMutation.error, '删除失败，请重新读取板子配置后核对。')}</p>}
                 <DialogFooter>
                     <Button type="button" variant="outline" disabled={deleteMutation.isPending} onClick={() => setDeleteTarget(null)}>取消</Button>
-                    <Button type="button" variant="destructive" disabled={disabled || !deleteTarget} onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget.iccid)}>{deleteMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Trash2 className="size-4"/>}确认删除绑定</Button>
+                    <Button type="button" variant="destructive" disabled={disabled || !deleteTarget} onClick={() => deleteTarget && deleteMutation.mutate(deleteTarget.iccid)}>{deleteMutation.isPending ? <Loader2 className="size-4 animate-spin"/> : <Trash2 className="size-4"/>}确认清除记录</Button>
                 </DialogFooter>
             </DialogContent>
         </Dialog>
@@ -325,15 +333,15 @@ export function DeviceForwardingSettings({simId, status, connected}: {simId?: st
     return <Card className="mt-4 gap-0 py-0">
         <CardHeader className="border-b border-slate-100 py-5">
             <CardTitle className="flex items-center gap-2 text-base"><CircuitBoard className="size-4 text-blue-600"/>当前号码的转发设置</CardTitle>
-            <p className="mt-1.5 text-xs leading-5 text-slate-500">设置保存在当前 Air780 板子中，并与当前 SIM 的 ICCID 绑定。换入未绑定的卡默认使用主机转发，插回已绑定的卡会恢复其设置；流量转发保存成功后，关闭 exe 或重新上电仍生效。</p>
+            <p className="mt-1.5 text-xs leading-5 text-slate-500">只记住需要 SIM 流量转发的卡，设置按 ICCID 保存在当前 Air780 板子中。未记录的卡默认使用主机转发，不占存储位置；插回已记住的卡会恢复流量转发，关闭 exe 或重新上电仍生效。</p>
         </CardHeader>
         <CardContent className="py-5">
             {!ready ? <p className="text-sm leading-6 text-slate-500">
-                {!connected ? '请连接 Air780 并选择在线 SIM。' : !compatible || status?.forward_binding_supported === false ? '请先将 Air780 的 main.lua 升级到 1.7.0 或更高版本，并同时更新配套 Lua 文件，才能使用按 SIM 绑定的转发设置。' : status?.flymode ? '请先关闭飞行模式并等待 SIM 身份确认，再读取或保存转发设置。' : '正在确认当前 SIM 身份，确认后才能配置板子。'}
+                {!connected ? '请连接 Air780 并选择在线 SIM。' : !compatible || status?.forward_binding_supported === false ? '请先将 Air780 的 main.lua 升级到 1.7.1 或更高版本，并同时更新配套 Lua 文件；1.7.0 的配置规则不同，升级后才能使用只记住流量转发卡的设置。' : status?.flymode ? '请先关闭飞行模式并等待 SIM 身份确认，再读取或保存转发设置。' : '正在确认当前 SIM 身份，确认后才能配置板子。'}
             </p> : configQuery.isPending ? <div className="flex items-center gap-2 text-sm text-slate-500"><Loader2 className="size-4 animate-spin"/>正在读取板子配置</div>
                 : configQuery.isError ? <div className="space-y-3"><p role="alert" className="text-sm text-rose-700">{getErrorMessage(configQuery.error, '读取板子配置失败')}</p><Button variant="outline" onClick={() => void configQuery.refetch()} disabled={configQuery.isFetching}><RefreshCw className="size-4"/>重新读取</Button></div>
                     : configQuery.data && <ForwardingEditor key={configQuery.dataUpdatedAt} simId={simId!} number={status?.mobile?.number} snapshot={configQuery.data} ready={ready} reading={configQuery.isFetching} onReload={() => void configQuery.refetch()} onSaved={(saved) => queryClient.setQueryData(queryKey, saved)}/>}
-            <p className="mt-4 text-xs leading-5 text-slate-400">换板需要重新配置；同一张卡回到已保存设置的原板子时可恢复绑定。首次配置需要连接 exe，后续独立转发仍需板子正常供电、SIM 短信与数据业务可用。</p>
+            <p className="mt-4 text-xs leading-5 text-slate-400">换板需要重新配置；已记住流量转发的卡插回原板子时可恢复设置。首次配置需要连接 exe，后续独立转发仍需板子正常供电、SIM 短信与数据业务可用。</p>
         </CardContent>
     </Card>;
 }

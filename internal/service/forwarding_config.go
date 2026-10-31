@@ -23,7 +23,7 @@ const MaxForwardingBindings = 4
 var (
 	ErrForwardingConfigInvalid      = errors.New("独立转发配置无效")
 	ErrForwardingConfigNotPersisted = errors.New("板子未确认持久保存配置")
-	ErrForwardingBindingLimit       = errors.New("板子最多保存 4 条 SIM 绑定，请先删除不再使用的绑定")
+	ErrForwardingBindingLimit       = errors.New("板子最多保存 4 条 SIM 独立转发绑定，请先删除不再使用的绑定")
 	forwardingChannelID             = regexp.MustCompile(`^[A-Za-z0-9_-]{1,40}$`)
 )
 
@@ -185,7 +185,7 @@ func supportsForwardingConfigProtocol(version string) bool {
 		}
 		parsed[i] = value
 	}
-	return parsed[0] > 1 || parsed[0] == 1 && parsed[1] >= 7
+	return parsed[0] > 1 || parsed[0] == 1 && (parsed[1] > 7 || parsed[1] == 7 && parsed[2] >= 1)
 }
 
 func (m *SerialManager) GetForwardingConfig(ctx context.Context, simID string) (*ForwardingConfigState, error) {
@@ -254,7 +254,7 @@ func (s *SerialService) forwardingConfigOperation(ctx context.Context, expected 
 				return err
 			}
 			if !supportsForwardingConfigProtocol(s.rememberScriptVersion("")) {
-				return fmt.Errorf("%w: 安全的 SIM 绑定转发配置需要 main.lua 1.7.0 或更高版本", ErrSIMProtocolOutdated)
+				return fmt.Errorf("%w: 独立转发绑定和主机模式清除配置需要 main.lua 1.7.1 或更高版本", ErrSIMProtocolOutdated)
 			}
 			validator, _ := s.getSIMRouteCallbacks()
 			if validator != nil {
@@ -279,7 +279,7 @@ func (s *SerialService) forwardingConfigOperation(ctx context.Context, expected 
 			if err != nil {
 				return err
 			}
-			if wanted != nil {
+			if wanted != nil && wanted.Mode == "direct" {
 				if persisted, _ := payload["persisted"].(bool); !persisted {
 					return ErrForwardingConfigNotPersisted
 				}
@@ -288,6 +288,16 @@ func (s *SerialService) forwardingConfigOperation(ctx context.Context, expected 
 				}
 				if iccid, _ := payload["bound_iccid"].(string); iccid != expected.ICCID {
 					return ErrSIMMismatch
+				}
+			} else if wanted != nil {
+				// UART is the default without a direct binding. A successful switch
+				// confirms removal, not storage of the submitted host-mode settings.
+				persisted, hasPersisted := payload["persisted"].(bool)
+				bound, hasBound := payload["sim_bound"].(bool)
+				iccid, hasICCID := payload["bound_iccid"].(string)
+				number, hasNumber := payload["bound_number"].(string)
+				if !hasPersisted || !hasBound || !hasICCID || !hasNumber || persisted || bound || iccid != "" || number != "" {
+					return ErrForwardingConfigNotPersisted
 				}
 			}
 		}
@@ -302,11 +312,16 @@ func (s *SerialService) forwardingConfigOperation(ctx context.Context, expected 
 		if err != nil {
 			return err
 		}
-		if wanted != nil && (!result.SIMBound || !result.Persisted || !reflect.DeepEqual(result.Config, *wanted)) {
+		if wanted != nil && wanted.Mode == "direct" &&
+			(!result.SIMBound || !result.Persisted || !reflect.DeepEqual(result.Config, *wanted)) {
 			return fmt.Errorf("%w: 保存后的回读不一致，请重新读取设备确认", ErrForwardingConfigNotPersisted)
 		}
+		if wanted != nil && wanted.Mode == "uart" && (result.SIMBound || result.Persisted || result.Config.Mode != "uart") {
+			return fmt.Errorf("%w: 未确认已切换到主机模式，请重新读取设备确认", ErrForwardingConfigNotPersisted)
+		}
 		for _, binding := range result.Bindings {
-			if deleteICCID != "" && binding.ICCID == deleteICCID {
+			if deleteICCID != "" && binding.ICCID == deleteICCID ||
+				wanted != nil && wanted.Mode == "uart" && binding.ICCID == expected.ICCID {
 				return fmt.Errorf("%w: 删除后的绑定仍存在，请重新读取设备确认", ErrForwardingConfigNotPersisted)
 			}
 		}
@@ -374,7 +389,7 @@ func decodeForwardingConfigState(payload map[string]interface{}, expectedICCID s
 	seen, currentFound := make(map[string]bool), false
 	for _, binding := range state.Bindings {
 		if !validForwardingBindingICCID(binding.ICCID) || seen[binding.ICCID] ||
-			(binding.Mode != "uart" && binding.Mode != "direct") || len(binding.Number) > 64 {
+			binding.Mode != "direct" || len(binding.Number) > 64 {
 			return rejected()
 		}
 		seen[binding.ICCID] = true
@@ -389,7 +404,7 @@ func decodeForwardingConfigState(payload map[string]interface{}, expectedICCID s
 		if state.BoundICCID != expectedICCID {
 			return nil, ErrSIMMismatch
 		}
-		if !state.Persisted || !currentFound {
+		if !state.Persisted || !currentFound || state.Config.Mode != "direct" {
 			return nil, ErrForwardingConfigNotPersisted
 		}
 	} else if state.Persisted || state.BoundICCID != "" || state.BoundNumber != "" || state.Config.Mode != "uart" {

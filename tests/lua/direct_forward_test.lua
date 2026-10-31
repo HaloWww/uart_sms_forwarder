@@ -521,7 +521,8 @@ local function load_main(configuration, config_error, options)
     options = options or {}
     local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {}, apn_calls = {},
         storage = options.storage or {}, http_calls = {}, time = 100, tx = 0, rx = 0,
-        fail_set = options.fail_set, fail_get = options.fail_get, storage_broken = options.storage_broken,
+        fail_set = options.fail_set, fail_get = options.fail_get, fail_del = options.fail_del,
+        storage_broken = options.storage_broken,
         readback_mismatch = options.readback_mismatch, current_iccid = options.iccid or message().iccid,
         network_status = 1, current_imsi = "460001234567890", current_number = "13800138000",
         cell_info = {mcc = 460, mnc = 0}}
@@ -875,7 +876,10 @@ function tests.main_saved_uart_mode_disables_standalone_forwarding_after_reboot(
     env:resume_tasks(3)
     local saved = env:command("set_forward_config", {mode = "uart", channels = {}})
     equal(saved.result, "ok")
-    equal(saved.persisted, true)
+    equal(saved.persisted, false)
+    equal(saved.sim_bound, false)
+    equal(#saved.bindings, 0)
+    equal(env.storage.direct_sim_v1_1, nil)
     env.events.SMS_INC("10086", "host only")
     env:resume_tasks(3)
     equal(#env.http_calls, 0)
@@ -1030,11 +1034,11 @@ function tests.main_new_sim_does_not_inherit_direct_and_original_sim_restores()
     equal(#env.http_calls, 1)
 end
 
-function tests.main_modes_are_saved_separately_for_each_sim_and_after_reboot()
+function tests.main_only_direct_sim_is_remembered_and_other_sims_default_to_host_after_reboot()
     local env = load_main(config(), nil, {use_real_direct = true})
     env:resume_tasks(3)
     env:switch_sim("898600000000002", "13900139000")
-    equal(env:command("set_forward_config", {mode = "uart", channels = {}}).sim_bound, true)
+    equal(env:command("set_forward_config", {mode = "uart", channels = {}}).sim_bound, false)
     local rebooted = load_main(config(), nil,
         {use_real_direct = true, storage = env.storage, iccid = "898600000000002"})
     rebooted.current_number = "13900139000"
@@ -1042,7 +1046,7 @@ function tests.main_modes_are_saved_separately_for_each_sim_and_after_reboot()
     equal(rebooted:command("get_forward_config").config.mode, "uart")
     rebooted:switch_sim(message().iccid, "13800138000")
     equal(rebooted:command("get_forward_config").config.mode, "direct")
-    equal(#rebooted:command("get_forward_config").bindings, 2)
+    equal(#rebooted:command("get_forward_config").bindings, 1)
 end
 
 function tests.main_changed_number_and_delayed_sim_event_never_enable_data()
@@ -1067,10 +1071,13 @@ function tests.main_binding_capacity_delete_and_failed_delete_are_explicit()
     env:resume_tasks(3)
     for index = 1, 4 do
         env:switch_sim("89860000000000" .. index)
-        equal(env:command("set_forward_config", {mode = "uart", channels = {}}).result, "ok")
+        equal(env:command("set_forward_config", config()).result, "ok")
     end
     env:switch_sim("898600000000005")
     equal(env:command("set_forward_config", config()).error, "binding_limit_reached")
+    local host = env:command("set_forward_config", {mode = "uart", channels = {}})
+    equal(host.result, "ok")
+    equal(host.sim_bound, false)
     equal(#env:command("get_forward_config").bindings, 4)
     env.fail_del = "direct_sim_v1_1"
     equal(env:command("delete_forward_config", "898600000000001").result, "error")
@@ -1170,6 +1177,82 @@ function tests.main_old_number_queue_stays_blocked_after_rebinding_same_iccid()
     env:resume_tasks(3)
     equal(#env.http_calls, 1)
     equal(env:status().forward_mode, "uart")
+end
+
+function tests.main_host_mode_never_consumes_a_record_for_new_sims()
+    local env = load_main({mode = "uart"}, nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    for index = 1, 10 do
+        env:switch_sim("8986000000000" .. string.format("%02d", index))
+        local result = env:command("set_forward_config", {mode = "uart", channels = {}})
+        equal(result.result, "ok")
+        equal(result.persisted, false)
+        equal(result.sim_bound, false)
+        equal(#result.bindings, 0)
+    end
+    for slot = 1, 4 do equal(env.storage["direct_sim_v1_" .. slot], nil) end
+    equal(#env.http_calls, 0)
+end
+
+function tests.main_upgrade_removes_old_uart_records_and_preserves_direct_records()
+    local env = load_main({mode = "uart"}, nil, {use_real_direct = true, storage = {
+        direct_sim_v1_1 = {iccid = message().iccid, number = "", config = {mode = "uart", channels = {}}},
+        direct_sim_v1_2 = {iccid = "898600000000002", number = "", config = config()},
+    }})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    equal(env.storage.direct_sim_v1_1, nil)
+    equal(env:command("get_forward_config").sim_bound, false)
+    equal(#env:command("get_forward_config").bindings, 1)
+    env:switch_sim("898600000000002")
+    equal(env:command("get_forward_config").config.mode, "direct")
+    equal(env:command("set_forward_config", {mode = "uart", channels = {}}).result, "ok")
+    equal(env.storage.direct_sim_v1_2, nil)
+    local restarted = load_main({mode = "uart"}, nil, {use_real_direct = true,
+        storage = env.storage, iccid = "898600000000002"})
+    restarted:resume_tasks(3)
+    equal(restarted:command("get_forward_config").config.mode, "uart")
+    equal(#restarted:command("get_forward_config").bindings, 0)
+end
+
+function tests.main_host_mode_delete_failure_does_not_report_disabled()
+    local env = load_main(config(), nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    env.fail_del = "direct_sim_v1_1"
+    equal(env:command("set_forward_config", {mode = "uart", channels = {}}).result, "error")
+    equal(env:command("get_forward_config").config.mode, "direct")
+    assert(env.storage.direct_sim_v1_1)
+end
+
+function tests.main_failed_uart_record_migration_never_activates_direct()
+    local env = load_main({mode = "uart"}, nil, {use_real_direct = true,
+        fail_del = "direct_sim_v1_1", storage = {
+        direct_sim_v1_1 = {iccid = "898600000000003", number = "", config = {mode = "uart", channels = {}}},
+        direct_sim_v1_2 = {iccid = message().iccid, number = "", config = config()},
+    }})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    equal(env:status().forward_mode, "uart")
+    env.events.SMS_INC("10086", "storage migration incomplete")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+end
+
+function tests.main_conflicting_old_host_and_direct_records_remain_disabled_after_reboot()
+    local storage = {
+        direct_sim_v1_1 = {iccid = message().iccid, number = "", config = {mode = "uart", channels = {}}},
+        direct_sim_v1_2 = {iccid = message().iccid, number = "", config = config()},
+    }
+    for _ = 1, 2 do
+        local env = load_main({mode = "uart"}, nil, {use_real_direct = true, storage = storage})
+        assert(env.loaded, env.load_error)
+        env:resume_tasks(3)
+        equal(env:status().forward_mode, "uart")
+        equal(env.storage.direct_sim_v1_1.config.mode, "uart")
+        env.events.SMS_INC("10086", "ambiguous legacy settings")
+        env:resume_tasks(3)
+        equal(#env.http_calls, 0)
+    end
 end
 
 function tests.main_invalid_binding_falls_back_to_host_without_spending_data()

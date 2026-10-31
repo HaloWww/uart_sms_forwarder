@@ -31,6 +31,7 @@ export const rebootMcu = (simId: string) => {
 export const getForwardingConfig = (simId: string) =>
   apiClient.get<ForwardingConfigResponse>('/serial/forwarding', {params: {simId}});
 
+// direct 记住当前 SIM；uart 清除此 SIM 的流量转发记录并恢复默认主机模式。
 export const saveForwardingConfig = (simId: string, config: ForwardingConfig) =>
   apiClient.put<ForwardingConfigResponse>('/serial/forwarding', {simId, config});
 

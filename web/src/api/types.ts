@@ -127,8 +127,8 @@ export interface ForwardingConfig {
 
 export interface ForwardingConfigResponse {
     config: ForwardingConfig;
-    persisted: boolean;
-    sim_bound: boolean;
+    persisted: boolean; // 当前 SIM 的流量转发记录已持久保存；默认主机模式为 false
+    sim_bound: boolean; // 只表示当前 SIM 存在已启用的流量转发记录
     bound_iccid: string;
     bound_number: string;
     binding_limit: number;
@@ -139,7 +139,7 @@ export interface ForwardingConfigResponse {
 export interface ForwardingBinding {
     iccid: string;
     number: string;
-    mode: ForwardingConfig['mode'];
+    mode: 'direct';
 }
 
 // 设备状态响应（来自 Lua 脚本的 status_response）

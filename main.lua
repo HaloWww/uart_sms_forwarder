@@ -1,14 +1,14 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.7.0
+-- VERSION: 1.7.1
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 log.info("main", PROJECT, VERSION)
 
@@ -45,7 +45,7 @@ if fskv and fskv.init and fskv.get and fskv.set and fskv.del then
     if config_store_ready then
         local old_ok, old = pcall(fskv.get, "direct_config_v1")
         legacy_unbound_config = legacy_unbound_config or (old_ok and old ~= nil)
-        local seen = {}
+        local seen, host_slots = {}, {}
         for slot = 1, binding_limit do
             local loaded, saved = pcall(fskv.get, binding_key(slot))
             if not loaded then binding_store_error = true end
@@ -57,7 +57,22 @@ if fskv and fskv.init and fskv.get and fskv.set and fskv.del then
                     binding_store_error = true
                 else
                     saved.config = normalized
-                    forwarding_bindings[slot], seen[saved.iccid] = saved, true
+                    seen[saved.iccid] = true
+                    if normalized.mode == "direct" then
+                        forwarding_bindings[slot] = saved
+                    else
+                        host_slots[#host_slots + 1] = slot
+                    end
+                end
+            end
+        end
+        -- 先检查全部记录再迁移，不能删掉冲突的主机记录后在下次启动误启用 direct。
+        if not binding_store_error then
+            for _, slot in ipairs(host_slots) do
+                local removed, result = pcall(fskv.del, binding_key(slot))
+                local verified, readback = pcall(fskv.get, binding_key(slot))
+                if not removed or result ~= true or not verified or readback ~= nil then
+                    binding_store_error = true
                 end
             end
         end
@@ -663,7 +678,8 @@ local function process_forward_config_command(command)
         if item and item.iccid == target_iccid then slot = index end
         if not item and not free_slot then free_slot = index end
     end
-    if command.action == "delete_forward_config" then
+    local use_host = command.action == "set_forward_config" and type(command.config) == "table" and command.config.mode == "uart"
+    if command.action == "delete_forward_config" or use_host then
         if slot then
             local removed, result = pcall(fskv.del, binding_key(slot))
             if not removed or result ~= true then respond("error", "storage_write_failed"); return end
