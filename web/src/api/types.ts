@@ -128,6 +128,18 @@ export interface ForwardingConfig {
 export interface ForwardingConfigResponse {
     config: ForwardingConfig;
     persisted: boolean;
+    sim_bound: boolean;
+    bound_iccid: string;
+    bound_number: string;
+    binding_limit: number;
+    bindings: ForwardingBinding[];
+    legacy_unbound: boolean;
+}
+
+export interface ForwardingBinding {
+    iccid: string;
+    number: string;
+    mode: ForwardingConfig['mode'];
 }
 
 // 设备状态响应（来自 Lua 脚本的 status_response）
@@ -148,6 +160,9 @@ export interface DeviceStatus {
     forward_mode?: 'uart' | 'direct';
     forward_config_supported?: boolean;
     forward_config_persisted?: boolean;
+    forward_binding_supported?: boolean;
+    forward_bound_iccid?: string;
+    forward_binding_required?: boolean;
     direct_forward?: DirectForwardStats;
 }
 

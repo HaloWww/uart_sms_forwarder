@@ -291,6 +291,7 @@ func setupApi(app *orz.App, handlers *Handlers, appConfig *config.AppConfig, log
 	api.POST("/serial/reboot", handlers.Serial.RebootMcu)
 	api.GET("/serial/forwarding", handlers.Serial.GetForwardingConfig)
 	api.PUT("/serial/forwarding", handlers.Serial.SetForwardingConfig)
+	api.DELETE("/serial/forwarding", handlers.Serial.DeleteForwardingConfig)
 
 	// ScheduledTask API (RESTful)
 	api.GET("/scheduled-tasks", handlers.ScheduledTask.List)

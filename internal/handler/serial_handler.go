@@ -37,6 +37,16 @@ func (h *SerialHandler) SetForwardingConfig(c *echo.Context) error {
 	return c.JSON(http.StatusOK, state)
 }
 
+func (h *SerialHandler) DeleteForwardingConfig(c *echo.Context) error {
+	c.Response().Header().Set("Cache-Control", "no-store")
+	state, err := h.serialManager.DeleteForwardingConfig(c.Request().Context(),
+		strings.TrimSpace(c.QueryParam("simId")), strings.TrimSpace(c.QueryParam("iccid")))
+	if err != nil {
+		return writeForwardingConfigError(c, err)
+	}
+	return c.JSON(http.StatusOK, state)
+}
+
 func writeForwardingConfigError(c *echo.Context, err error) error {
 	status, code, message := http.StatusServiceUnavailable, "forwarding_config_failed", "无法读取或保存板子的转发设置"
 	switch {
@@ -44,8 +54,10 @@ func writeForwardingConfigError(c *echo.Context, err error) error {
 		status, code, message = http.StatusBadRequest, "forwarding_config_invalid", err.Error()
 	case errors.Is(err, service.ErrForwardingConfigNotPersisted):
 		status, code, message = http.StatusConflict, "forwarding_not_persisted", "板子未确认持久保存，请重新读取设备确认设置，检查存储后重试"
+	case errors.Is(err, service.ErrForwardingBindingLimit):
+		status, code, message = http.StatusConflict, "binding_limit_reached", "板子最多保存 4 条 SIM 绑定，请先删除不再使用的绑定"
 	case errors.Is(err, service.ErrSIMProtocolOutdated):
-		status, code, message = http.StatusConflict, "lua_script_outdated", "此功能需要 main.lua 1.6.0 或更高版本，请先更新设备脚本"
+		status, code, message = http.StatusConflict, "lua_script_outdated", "此功能需要 main.lua 1.7.0 或更高版本，以确保转发设置绑定当前 SIM，请先更新设备脚本"
 	case errors.Is(err, service.ErrControlCommandTimeout):
 		status, code, message = http.StatusGatewayTimeout, "forwarding_timeout", "等待板子确认超时；配置可能已写入，请重新读取设备确认，不要反复保存"
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):

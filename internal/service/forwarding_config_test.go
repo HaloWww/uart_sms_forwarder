@@ -33,7 +33,7 @@ func testForwardingManager(t *testing.T) (*SerialManager, *SerialService, *captu
 	port := &capturingSerialPort{}
 	s.installSerialPort(port)
 	s.setConnected(true)
-	s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.6.0","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986001"}}`})
+	s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.7.0","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986001"}}`})
 	return m, s, port
 }
 
@@ -58,6 +58,23 @@ func configAsPayload(config ForwardingConfig) map[string]interface{} {
 	return data
 }
 
+func boundTestForwardingPayload(config ForwardingConfig, persisted bool) map[string]interface{} {
+	return map[string]interface{}{
+		"config": configAsPayload(config), "persisted": persisted, "sim_bound": true,
+		"bound_iccid": "8986001", "bound_number": "13800138000", "binding_limit": 4,
+		"legacy_unbound": false,
+		"bindings":       []ForwardingBinding{{ICCID: "8986001", Number: "13800138000", Mode: config.Mode}},
+	}
+}
+
+func unboundTestForwardingPayload(config ForwardingConfig) map[string]interface{} {
+	return map[string]interface{}{
+		"config": configAsPayload(config), "persisted": false, "sim_bound": false,
+		"bound_iccid": "", "bound_number": "", "binding_limit": 4,
+		"legacy_unbound": true, "bindings": map[string]interface{}{},
+	}
+}
+
 func TestForwardingConfigSaveRequiresPersistentACKAndReadback(t *testing.T) {
 	m, s, port := testForwardingManager(t)
 	wanted := validTestForwardingConfig()
@@ -76,13 +93,15 @@ func TestForwardingConfigSaveRequiresPersistentACKAndReadback(t *testing.T) {
 		if action == "set_forward_config" {
 			saved, _ = cmd["config"].(map[string]interface{})
 		}
-		testForwardingResponse(s, cmd, "ok", map[string]interface{}{"persisted": true, "config": saved})
+		payload := boundTestForwardingPayload(wanted, true)
+		payload["config"] = saved
+		testForwardingResponse(s, cmd, "ok", payload)
 	}
 	state, err := m.SetForwardingConfig(context.Background(), "iccid:8986001", wanted)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !state.Persisted || !reflect.DeepEqual(state.Config, wanted) {
+	if !state.Persisted || !state.SIMBound || state.BoundICCID != "8986001" || !reflect.DeepEqual(state.Config, wanted) {
 		t.Fatalf("incorrect readback: %+v", state)
 	}
 	if !reflect.DeepEqual(actions, []string{"set_forward_config", "get_forward_config"}) {
@@ -106,7 +125,7 @@ func TestForwardingConfigDoesNotReportSuccessForUnpersistedOrDifferentReadback(t
 				if scenario == "readback_changed" {
 					actual.Mode = "uart"
 				}
-				testForwardingResponse(s, cmd, "ok", map[string]interface{}{"persisted": persisted, "config": configAsPayload(actual)})
+				testForwardingResponse(s, cmd, "ok", boundTestForwardingPayload(actual, persisted))
 			}
 			if _, err := m.SetForwardingConfig(context.Background(), "iccid:8986001", wanted); !errors.Is(err, ErrForwardingConfigNotPersisted) {
 				t.Fatalf("false save success: %v", err)
@@ -124,7 +143,7 @@ func TestForwardingConfigRejectsOldFirmwareAndChangedSIMBeforeWire(t *testing.T)
 			}
 			expected := SIMIdentity{SIMID: "iccid:8986001", ICCID: "8986001", Verified: true}
 			if scenario == "sim_changed" {
-				s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.6.0","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986002"}}`})
+				s.handleStatusResponse(&ParsedMessage{JSON: `{"type":"status_response","version":"1.7.0","identity_valid":true,"mobile":{"sim_ready":true,"iccid":"8986002"}}`})
 			}
 			_, err := s.forwardingConfig(context.Background(), expected, nil)
 			if err == nil {
@@ -152,7 +171,7 @@ func TestForwardingConfigCorrelationAndCancellation(t *testing.T) {
 				if scenario == "wrong_action" {
 					cmd["action"] = "set_flymode"
 				}
-				testForwardingResponse(s, cmd, "ok", map[string]interface{}{"persisted": true, "config": configAsPayload(validTestForwardingConfig())})
+				testForwardingResponse(s, cmd, "ok", boundTestForwardingPayload(validTestForwardingConfig(), true))
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 			defer cancel()
@@ -177,15 +196,16 @@ func TestGetForwardingConfigAcceptsUnpersistedDefaultsAndEmptyLuaArray(t *testin
 		if cmd["request_id"] == nil {
 			return
 		}
-		payload := configAsPayload(wanted)
-		payload["channels"] = map[string]interface{}{}
-		testForwardingResponse(s, cmd, "ok", map[string]interface{}{"persisted": false, "config": payload})
+		payload := unboundTestForwardingPayload(wanted)
+		payload["config"].(map[string]interface{})["channels"] = map[string]interface{}{}
+		testForwardingResponse(s, cmd, "ok", payload)
 	}
 	state, err := m.GetForwardingConfig(context.Background(), "iccid:8986001")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Persisted || !reflect.DeepEqual(state.Config, wanted) {
+	if state.Persisted || state.SIMBound || state.BoundICCID != "" || state.BindingLimit != 4 ||
+		len(state.Bindings) != 0 || !state.LegacyUnbound || !reflect.DeepEqual(state.Config, wanted) {
 		t.Fatalf("unexpected defaults: %+v", state)
 	}
 }

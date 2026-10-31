@@ -60,6 +60,7 @@ jobs:
         run: |
           luac -p main.lua direct_forward.lua forward_config.lua
           lua tests/lua/direct_forward_test.lua
+          lua tests/lua/configure_engine_test.lua
 
       - name: 使用 Make 构建前后端（多平台）
         run: |

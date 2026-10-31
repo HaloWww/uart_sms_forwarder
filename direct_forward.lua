@@ -35,7 +35,7 @@ local function route_key(channel)
 end
 
 -- 独立校验/规范化用于串口配置与启动恢复；不会发起 HTTP 或修改 Flash。
-function M.validate_config(value)
+function M.validate_config(value, json_impl)
     if type(value) ~= "table" or (value.mode ~= "uart" and value.mode ~= "direct") then
         return nil, "invalid_forward_mode"
     end
@@ -104,7 +104,9 @@ function M.validate_config(value)
         normalized.channels[index] = item
     end
     if value.mode == "direct" and enabled == 0 then return nil, "no_enabled_channels" end
-    local ok, encoded = pcall(json.encode, normalized)
+    local encoder = json_impl or json
+    if not encoder or type(encoder.encode) ~= "function" then return nil, "config_encoding_failed" end
+    local ok, encoded = pcall(encoder.encode, normalized)
     if not ok or type(encoded) ~= "string" then return nil, "config_encoding_failed" end
     if #encoded > 3800 then return nil, "config_too_large" end
     if encoded:find(":CMD_END", 1, true) or encoded:find(":SMS_END", 1, true) then
@@ -121,58 +123,61 @@ function M.new(config, deps)
     local store = deps.fskv or fskv
     local now = deps.now or function() return mcu.ticks2() end
     local can_send = deps.can_send or function() return true end
-    local limit = bounded(config.queue_limit, 8, 1, SLOT_COUNT)
-    local max_attempts = bounded(config.max_attempts, 3, 1, 10)
-    local retry_base = bounded(config.retry_base_seconds, 30, 5, 3600)
-    local retry_max = bounded(config.retry_max_seconds, 900, retry_base, 86400)
-    local interval = bounded(config.min_interval_seconds, 2, 1, 3600)
-    local save_interval = bounded(config.stats_save_seconds, 60, 10, 3600)
+    local max_attempts, retry_base, retry_max = 3, 30, 900
+    local interval, save_interval = 2, 60
     local last_attempt, last_save = -math.huge, now()
     local dirty = false
+    local store_ready, store_loaded = false, false
     local stats = {sent = 0, failed = 0, dropped = 0, requests = 0, unmetered_requests = 0,
         tx_bytes = 0.0, rx_bytes = 0.0, last_error = "", counter_available = false,
-        storage_available = false, enabled = config.mode == "direct"}
+        storage_available = false, enabled = false}
 
     local function error_status(reason)
         stats.last_error, dirty = reason, true
     end
-    if stats.enabled then
-        if not json_api or not http_api or not socket_api or socket_api.LWIP_GP == nil then
-            stats.enabled = false
-            error_status("firmware_missing_http_json_or_cellular_adapter")
-        end
-        local ids = {}
-        for index, channel in ipairs(config.channels or {}) do
-            if channel.enabled then
-                local id = channel.id or tostring(index)
-                local valid = not ids[id] and type(id) == "string" and id:match("^[%w_-]+$")
-                if channel.type == "bark" then
-                    valid = valid and https(channel.server or "https://api.day.app") and nonempty(channel.key)
-                elseif channel.type == "wecom_app" then
-                    valid = valid and nonempty(channel.corp_id) and nonempty(channel.secret) and
-                        tonumber(channel.agent_id) and tonumber(channel.agent_id) > 0 and nonempty(channel.to_user)
-                elseif channel.type == "webhook" then
-                    valid = valid and https(channel.url)
-                else
-                    valid = false
-                end
-                if not valid then
-                    stats.enabled = false
-                    error_status("invalid_channel_config_" .. index)
-                else
-                    channel.id = id
-                    ids[id], self.channels[id] = true, channel
-                end
+    local function prepare_configuration(value)
+        local normalized, reason = M.validate_config(value, json_api)
+        if not normalized then return nil, nil, reason end
+        local channels = {}
+        if normalized.mode == "direct" then
+            if not json_api or type(json_api.encode) ~= "function" or type(json_api.decode) ~= "function" or
+                not http_api or type(http_api.request) ~= "function" or
+                not socket_api or socket_api.LWIP_GP == nil or type(socket_api.adapter) ~= "function" then
+                return nil, nil, "firmware_missing_http_json_or_cellular_adapter"
+            end
+            for _, channel in ipairs(normalized.channels) do
+                if channel.enabled then channels[channel.id] = channel end
             end
         end
-        if next(self.channels) == nil then
-            stats.enabled = false
-            error_status("no_enabled_channels")
-        end
+        return normalized, channels
     end
 
-    local store_ready = false
-    if stats.enabled and store and store.init and store.get and store.set and store.del then
+    -- 主调度器仅在没有 HTTP 在途时调用；切换配置不重建共享队列和统计。
+    function self:configure(value)
+        stats.enabled = false
+        self.channels, self.tokens = {}, {}
+        local normalized, channels, reason = prepare_configuration(value)
+        if not normalized then
+            config = {mode = "uart", channels = {}}
+            self.config = config
+            error_status(reason)
+            return false, reason
+        end
+        config, self.config, self.channels = normalized, normalized, channels
+        max_attempts = normalized.max_attempts
+        retry_base, retry_max = normalized.retry_base_seconds, normalized.retry_max_seconds
+        interval, save_interval = normalized.min_interval_seconds, normalized.stats_save_seconds
+        stats.enabled = normalized.mode == "direct"
+        if store_loaded and not stats.storage_available then
+            if not stats.last_error:find("storage", 1, true) then
+                error_status("storage_unavailable_ram_only")
+            end
+        else stats.last_error = "" end
+        return true
+    end
+    self:configure(config)
+
+    if store and store.init and store.get and store.set and store.del then
         local ok, result = pcall(store.init)
         store_ready = ok and result == true
         stats.storage_available = store_ready
@@ -208,6 +213,7 @@ function M.new(config, deps)
             end
         end
     end
+    store_loaded = true
     if stats.enabled and not store_ready then error_status("storage_unavailable_ram_only") end
 
     local function persist(item, remove)
@@ -244,14 +250,14 @@ function M.new(config, deps)
             type(rx_gb) ~= "number" or type(rx_b) ~= "number" then return nil end
         return {tx_gb, tx_b, rx_gb, rx_b}
     end
-    local function ready(iccid)
-        local ok, value = pcall(can_send, iccid)
+    local function ready(iccid, receiver)
+        local ok, value = pcall(can_send, iccid, receiver)
         if not ok or not value then return false end
         local net_ok, connected = pcall(socket_api.adapter, socket_api.LWIP_GP)
         return net_ok and connected == true
     end
     local function request(channel, item, method, url, payload)
-        if not ready(item.message.iccid) then return nil, nil, "network_or_sim_not_ready" end
+        if not ready(item.message.iccid, item.message.number) then return nil, nil, "network_or_sim_not_ready" end
         local headers = {["Accept"] = "application/json"}
         local body
         if payload then
@@ -345,9 +351,21 @@ function M.new(config, deps)
         end
         return true
     end
-    function self:enqueue(message)
-        if config.mode ~= "direct" then return false end
-        if not stats.enabled then stats.dropped, dirty = stats.dropped + 1, true; return false end
+    function self:enqueue(message, message_config)
+        local incoming_config = config
+        if message_config ~= nil then
+            local normalized, _, reason = prepare_configuration(message_config)
+            if not normalized then
+                stats.dropped = stats.dropped + 1
+                error_status(reason)
+                return false
+            end
+            incoming_config = normalized
+        elseif not stats.enabled and config.mode == "direct" then
+            stats.dropped, dirty = stats.dropped + 1, true
+            return false
+        end
+        if incoming_config.mode ~= "direct" then return false end
         if not message.identity_valid or not nonempty(message.iccid) or not nonempty(message.message_id) then
             stats.dropped = stats.dropped + 1
             error_status("incoming_sim_identity_unavailable")
@@ -356,7 +374,7 @@ function M.new(config, deps)
         for _, item in ipairs(self.queue) do
             if item.message.message_id == message.message_id then return true end
         end
-        if #self.queue >= limit then
+        if #self.queue >= bounded(incoming_config.queue_limit, 8, 1, SLOT_COUNT) then
             stats.dropped = stats.dropped + 1
             error_status("queue_full")
             return false
@@ -371,11 +389,11 @@ function M.new(config, deps)
             imei = message.imei or "", imsi = message.imsi or "",
             timestamp = tostring(message.timestamp or 0)}
         values.time = os.date("!%Y-%m-%d %H:%M:%S", (message.timestamp or 0) +
-            (tonumber(config.timezone_offset_seconds) or 28800))
-        item.rendered = (config.template or "{{content}}\n来自：{{from}}\n{{time}}"):gsub("{{([%w_]+)}}", function(key)
+            (tonumber(incoming_config.timezone_offset_seconds) or 28800))
+        item.rendered = (incoming_config.template or "{{content}}\n来自：{{from}}\n{{time}}"):gsub("{{([%w_]+)}}", function(key)
             return values[key] or ""
         end)
-        for _, channel in ipairs(config.channels or {}) do
+        for _, channel in ipairs(incoming_config.channels or {}) do
             if channel.enabled then
                 item.targets[#item.targets + 1] = {id = channel.id, route = route_key(channel), attempts = 0, next_at = 0}
             end
@@ -396,11 +414,11 @@ function M.new(config, deps)
         return true
     end
     function self:step()
-        if not stats.enabled then return end
         if dirty and now() - last_save >= save_interval then self:flush() end
+        if not stats.enabled then return end
         if now() - last_attempt < interval then return end
         for index, item in ipairs(self.queue) do
-            if ready(item.message.iccid) then
+            if ready(item.message.iccid, item.message.number) then
                 for _, target in ipairs(item.targets) do
                     if not target.done and (target.next_at or 0) <= now() then
                         local channel = self.channels[target.id]

@@ -519,11 +519,17 @@ end
 -- library is loaded and no code substitutions are made in main.lua.
 local function load_main(configuration, config_error, options)
     options = options or {}
-    local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {},
+    local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {}, apn_calls = {},
         storage = options.storage or {}, http_calls = {}, time = 100, tx = 0, rx = 0,
         fail_set = options.fail_set, fail_get = options.fail_get, storage_broken = options.storage_broken,
-        readback_mismatch = options.readback_mismatch, current_iccid = message().iccid,
-        network_status = 1, current_imsi = "460001234567890", cell_info = {mcc = 460, mnc = 0}}
+        readback_mismatch = options.readback_mismatch, current_iccid = options.iccid or message().iccid,
+        network_status = 1, current_imsi = "460001234567890", current_number = "13800138000",
+        cell_info = {mcc = 460, mnc = 0}}
+    if configuration and configuration.mode == "direct" and not options.unbound and not options.storage then
+        local initial = copy(configuration)
+        if not initial.channels or #initial.channels == 0 then initial = config() end
+        env.storage.direct_sim_v1_1 = {iccid = env.current_iccid, number = env.current_number, config = initial}
+    end
     local sandbox = setmetatable({}, {__index = _G})
     local noop = function() end
     local sys = {
@@ -541,9 +547,10 @@ local function load_main(configuration, config_error, options)
         write = function(_, frame) env.frames[#env.frames + 1] = frame; return #frame end,
     }
     sandbox.mobile = {
-        apn = noop, setAuto = noop, simid = function() return 0 end,
+        apn = function(_, _, value) env.apn_calls[#env.apn_calls + 1] = value end,
+        setAuto = noop, simid = function() return 0 end,
         simPin = function() return true end, iccid = function() return message().iccid end,
-        imsi = function() return env.current_imsi end, number = function() return "13800138000" end,
+        imsi = function() return env.current_imsi end, number = function() return env.current_number end,
         imei = function() return "123456789012345" end, muid = function() return "module-identity" end,
         status = function() return env.network_status end, csq = function() return 25 end,
         scell = function()
@@ -564,7 +571,7 @@ local function load_main(configuration, config_error, options)
         init = function() return not env.storage_broken end,
         get = function(key)
             if env.fail_get == key then error("simulated Flash read failure") end
-            if env.readback_mismatch and key == "direct_config_v1" and env.last_set == key then
+            if env.readback_mismatch and key == "direct_sim_v1_1" and env.last_set == key then
                 return {mode = "uart", channels = {}}
             end
             return copy(env.storage[key])
@@ -572,15 +579,25 @@ local function load_main(configuration, config_error, options)
         set = function(key, value)
             if env.storage_broken or env.fail_set == key then return false end
             env.storage[key], env.last_set = copy(value), key
+            if env.write_hook then env.write_hook(key) end
             return true
         end,
-        del = function(key) env.storage[key] = nil; return true end,
+        del = function(key)
+            if env.fail_del == key then return false end
+            env.storage[key] = nil; return true
+        end,
     }
     sandbox.socket = {LWIP_GP = 4, adapter = function(adapter) return adapter == 4 end}
     sandbox.http = {request = function(method, url, headers, body, request_options)
         env.http_calls[#env.http_calls + 1] = {method = method, url = url, headers = copy(headers), body = body, options = copy(request_options)}
         env.tx, env.rx = env.tx + 100, env.rx + 200
-        return {wait = function() return 200, {}, json.encode({code = 200, errcode = 0}) end}
+        return {wait = function()
+            if env.http_yield then
+                env.http_task = coroutine.running()
+                coroutine.yield("http_inflight")
+            end
+            return 200, {}, json.encode({code = 200, errcode = 0, access_token = "test-token", expires_in = 7200})
+        end}
     end}
     sandbox.mobile.iccid = function() return env.current_iccid end
     sandbox.mobile.dataTraffic = function() return 0, env.tx, 0, env.rx end
@@ -602,11 +619,13 @@ local function load_main(configuration, config_error, options)
         if name == "direct_forward" then
             if options.use_real_direct then return actual_direct_module() end
             return {validate_config = function(value) return actual_direct_module().validate_config(value) end,
-                new = function(_, deps)
+                new = function(initial, deps)
                 env.direct_deps = deps
+                local current = initial
                 return {
                     enqueue = function(_, msg) env.forwarded[#env.forwarded + 1] = copy(msg); return true end,
-                    status = function() return {enabled = true, queued = #env.forwarded} end,
+                    configure = function(_, value) current = value; return true end,
+                    status = function() return {enabled = current.mode == "direct", queued = #env.forwarded, storage_available = true} end,
                     step = noop, flush = noop,
                 }
             end}
@@ -617,10 +636,10 @@ local function load_main(configuration, config_error, options)
     assert(chunk, err)
     env.loaded, env.load_error = pcall(chunk)
     env.sandbox = sandbox
-    function env:resume_tasks(rounds)
+    function env:resume_tasks(rounds, skip_http)
         for _ = 1, rounds or 1 do
             for _, task in ipairs(self.tasks) do
-                if coroutine.status(task) ~= "dead" then
+                if coroutine.status(task) ~= "dead" and (not skip_http or task ~= self.http_task) then
                     local ok, task_error = coroutine.resume(task)
                     assert(ok, task_error)
                 end
@@ -648,7 +667,8 @@ local function load_main(configuration, config_error, options)
     function env:command(action, value, expected_iccid)
         local request_id = action .. "-" .. tostring(#self.frames + 1)
         self.sandbox.process_uart_command({action = action, request_id = request_id,
-            expected_iccid = expected_iccid or message().iccid, config = value})
+            expected_iccid = expected_iccid or self.current_iccid,
+            delete_iccid = action == "delete_forward_config" and value or nil, config = value})
         self:flush_uart()
         local reply = self:last_response(request_id)
         assert(reply, "missing response for " .. action)
@@ -658,6 +678,12 @@ local function load_main(configuration, config_error, options)
         self.sandbox.process_uart_command({action = "get_status"})
         self:flush_uart()
         return assert(self:last_frame("status_response"))
+    end
+    function env:switch_sim(iccid, number)
+        self.current_iccid = iccid
+        if number ~= nil then self.current_number = number end
+        self.events.SIM_IND("RDY")
+        self:resume_tasks(3, self.http_yield)
     end
     return env
 end
@@ -740,10 +766,10 @@ function tests.main_serving_network_is_not_reported_across_sim_or_registration_c
     equal(env:status().mobile.serving_mcc, nil)
 end
 
-function tests.main_uart_default_does_not_import_direct_network_engine()
+function tests.main_uart_default_does_not_use_mobile_network()
     local env = load_main({mode = "uart"})
     assert(env.loaded, env.load_error)
-    equal(env.imports.direct_forward, nil)
+    equal(env.imports.direct_forward, true)
     env:resume_tasks(3)
     env.events.SMS_INC("10086", "host forwarded")
     env:flush_uart()
@@ -781,7 +807,7 @@ end
 function tests.main_missing_optional_configuration_keeps_legacy_uart_mode()
     local env = load_main(nil, "module 'forward_config' not found: no file './forward_config.lua'")
     assert(env.loaded, env.load_error)
-    equal(env.imports.direct_forward, nil)
+    equal(env.imports.direct_forward, true)
     env:resume_tasks(3)
     env.sandbox.process_uart_command({action = "get_status"})
     env:flush_uart()
@@ -815,8 +841,9 @@ function tests.main_saved_direct_mode_works_without_host_and_survives_power_cycl
     local saved = env:command("set_forward_config", config())
     equal(saved.result, "ok")
     equal(saved.persisted, true)
-    equal(env.storage.direct_config_v1.mode, "direct")
-    equal(env.storage.direct_config_v1.channels[1].key, default_channel.key)
+    equal(env.storage.direct_sim_v1_1.iccid, env.current_iccid)
+    equal(env.storage.direct_sim_v1_1.config.mode, "direct")
+    equal(env.storage.direct_sim_v1_1.config.channels[1].key, default_channel.key)
     local readback = env:command("get_forward_config")
     equal(readback.config.mode, "direct")
     equal(readback.persisted, true)
@@ -864,13 +891,13 @@ end
 
 function tests.main_configuration_save_failure_is_not_acknowledged_or_activated()
     local env = load_main({mode = "uart", channels = {}}, nil,
-        {use_real_direct = true, fail_set = "direct_config_v1"})
+        {use_real_direct = true, fail_set = "direct_sim_v1_1"})
     assert(env.loaded, env.load_error)
     env:resume_tasks(3)
     local failed = env:command("set_forward_config", config())
     equal(failed.result, "error")
     assert(failed.persisted ~= true)
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
     equal(env:command("get_forward_config").config.mode, "uart")
     env.events.SMS_INC("10086", "must remain host forwarded")
     env:resume_tasks(3)
@@ -884,7 +911,7 @@ function tests.main_configuration_requires_flash_before_success()
     env:resume_tasks(3)
     local failed = env:command("set_forward_config", config())
     equal(failed.result, "error")
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
     equal(env:command("get_forward_config").config.mode, "uart")
 end
 
@@ -894,7 +921,7 @@ function tests.main_configuration_queue_restore_error_does_not_activate_candidat
     assert(env.loaded, env.load_error)
     env:resume_tasks(3)
     equal(env:command("set_forward_config", config()).result, "error")
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
     equal(env:command("get_forward_config").config.mode, "uart")
     env.events.SMS_INC("10086", "stay on the previous mode after restore failure")
     env:resume_tasks(3)
@@ -907,10 +934,10 @@ function tests.main_configuration_rejects_wrong_sim_and_missing_correlation()
     env:resume_tasks(3)
     equal(env:command("set_forward_config", config(), "different-sim").result, "error")
     equal(env:command("get_forward_config", nil, "different-sim").result, "error")
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
     env.sandbox.process_uart_command({action = "set_forward_config", expected_iccid = message().iccid, config = config()})
     env:flush_uart()
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
     equal(env:command("get_forward_config").config.mode, "uart")
 end
 
@@ -933,7 +960,7 @@ function tests.main_configuration_rejects_invalid_or_oversize_settings_without_s
     local protocol_marker = config()
     protocol_marker.template = "{{content}}:CMD_END"
     equal(env:command("set_forward_config", protocol_marker).result, "error")
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
 end
 
 function tests.main_configuration_readback_mismatch_does_not_activate_direct()
@@ -947,12 +974,12 @@ function tests.main_configuration_readback_mismatch_does_not_activate_direct()
     env:resume_tasks(3)
     equal(#env.http_calls, 0)
     -- Rollback must prevent a later reboot from activating a failed save.
-    equal(env.storage.direct_config_v1, nil)
+    equal(env.storage.direct_sim_v1_1, nil)
 end
 
 function tests.main_generic_status_does_not_expose_saved_channel_keys()
     local env = load_main({mode = "uart", channels = {}}, nil,
-        {use_real_direct = true, storage = {direct_config_v1 = config()}})
+        {use_real_direct = true, storage = {direct_sim_v1_1 = {iccid = message().iccid, number = "", config = config()}}})
     assert(env.loaded, env.load_error)
     env:resume_tasks(3)
     env.sandbox.process_uart_command({action = "get_status"})
@@ -963,13 +990,197 @@ function tests.main_generic_status_does_not_expose_saved_channel_keys()
     assert(not json.encode(status):find(default_channel.key, 1, true))
 end
 
-function tests.main_invalid_saved_config_does_not_silently_revert_to_uart()
+function tests.main_legacy_and_script_defaults_do_not_claim_current_sim()
+    for _, old in ipairs({{}, {direct_config_v1 = config()}}) do
+        local env = load_main(config(), nil, {use_real_direct = true, storage = old, unbound = true})
+        assert(env.loaded, env.load_error)
+        env:resume_tasks(3)
+        local initial = env:command("get_forward_config")
+        equal(initial.config.mode, "uart")
+        equal(initial.sim_bound, false)
+        equal(initial.legacy_unbound, true)
+        env.events.SMS_INC("10086", "must not spend data before binding")
+        env:resume_tasks(3)
+        equal(#env.http_calls, 0)
+        equal(env:command("set_forward_config", config()).sim_bound, true)
+        equal(env:command("get_forward_config").legacy_unbound, false)
+    end
+end
+
+function tests.main_new_sim_does_not_inherit_direct_and_original_sim_restores()
+    local env = load_main(config(), nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    equal(env:status().forward_mode, "direct")
+    env:switch_sim("898600000000002", "13900139000")
+    local fresh = env:command("get_forward_config")
+    equal(fresh.sim_bound, false)
+    equal(fresh.config.mode, "uart")
+    equal(env:status().forward_binding_required, true)
+    env.events.SMS_INC("10086", "new SIM uses host")
+    env.events.CC_IND("INCOMINGCALL")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+    equal(env:last_frame("incoming_sms").forward_mode, "uart")
+    equal(env:last_frame("incoming_call").forward_mode, "uart")
+    env:switch_sim(message().iccid, "13800138000")
+    equal(env:status().forward_mode, "direct")
+    equal(env:command("get_forward_config").bound_iccid, message().iccid)
+    env.events.SMS_INC("10086", "original SIM resumes direct")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 1)
+end
+
+function tests.main_modes_are_saved_separately_for_each_sim_and_after_reboot()
+    local env = load_main(config(), nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    env:switch_sim("898600000000002", "13900139000")
+    equal(env:command("set_forward_config", {mode = "uart", channels = {}}).sim_bound, true)
+    local rebooted = load_main(config(), nil,
+        {use_real_direct = true, storage = env.storage, iccid = "898600000000002"})
+    rebooted.current_number = "13900139000"
+    rebooted:resume_tasks(3)
+    equal(rebooted:command("get_forward_config").config.mode, "uart")
+    rebooted:switch_sim(message().iccid, "13800138000")
+    equal(rebooted:command("get_forward_config").config.mode, "direct")
+    equal(#rebooted:command("get_forward_config").bindings, 2)
+end
+
+function tests.main_changed_number_and_delayed_sim_event_never_enable_data()
+    local env = load_main(config(), nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    env.current_number = "13900139000"
+    env.events.SMS_INC("10086", "subscription number changed")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+    equal(env:status().forward_mode, "uart")
+    equal(env:command("get_forward_config").sim_bound, false)
+    env.current_number = "13800138000"
+    env.current_iccid = "898600000000002" -- no SIM_IND notification yet
+    env.events.SMS_INC("10086", "new profile before identity event")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+    equal(env:status().forward_mode, "uart")
+end
+
+function tests.main_binding_capacity_delete_and_failed_delete_are_explicit()
+    local env = load_main({mode = "uart"}, nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    for index = 1, 4 do
+        env:switch_sim("89860000000000" .. index)
+        equal(env:command("set_forward_config", {mode = "uart", channels = {}}).result, "ok")
+    end
+    env:switch_sim("898600000000005")
+    equal(env:command("set_forward_config", config()).error, "binding_limit_reached")
+    equal(#env:command("get_forward_config").bindings, 4)
+    env.fail_del = "direct_sim_v1_1"
+    equal(env:command("delete_forward_config", "898600000000001").result, "error")
+    equal(#env:command("get_forward_config").bindings, 4)
+    env.fail_del = nil
+    equal(env:command("delete_forward_config", "898600000000001").result, "ok")
+    equal(env:command("set_forward_config", config()).result, "ok")
+    equal(env:command("delete_forward_config", env.current_iccid).sim_bound, false)
+    env.events.SMS_INC("10086", "deleted binding uses host")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+end
+
+function tests.main_http_wait_preserves_each_sim_template_and_destination()
+    local a, b = config(), config()
+    a.template, b.template = "A:{{content}}", "B:{{content}}"
+    b.channels[1].key = "second-sim-secret"
+    local env = load_main({mode = "uart"}, nil, {use_real_direct = true, storage = {
+        direct_sim_v1_1 = {iccid = message().iccid, number = "", config = a},
+        direct_sim_v1_2 = {iccid = "898600000000002", number = "", config = b},
+    }})
+    env:resume_tasks(3)
+    env.http_yield = true
+    env.events.SMS_INC("10086", "first")
+    env:resume_tasks(1)
+    equal(#env.http_calls, 1)
+    env:switch_sim("898600000000002")
+    env.events.SMS_INC("10086", "second")
+    equal(#env.http_calls, 1)
+    env.http_yield = false
+    env.time = env.time + 5
+    env:resume_tasks(4)
+    equal(#env.http_calls, 2)
+    local first, second = json.decode(env.http_calls[1].body), json.decode(env.http_calls[2].body)
+    equal(first.device_key, default_channel.key)
+    equal(first.body, "A:first")
+    equal(second.device_key, "second-sim-secret")
+    equal(second.body, "B:second")
+end
+
+function tests.main_sim_change_after_wecom_token_blocks_followup_http()
+    local wecom = config({{id = "wecom", type = "wecom_app", enabled = true,
+        corp_id = "corp", secret = "secret", agent_id = 1, to_user = "user"}})
+    local env = load_main(wecom, nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    env.http_yield = true
+    env.events.SMS_INC("10086", "private")
+    env:resume_tasks(1)
+    equal(#env.http_calls, 1)
+    env:switch_sim("898600000000002")
+    env.http_yield = false
+    env:resume_tasks(4)
+    equal(#env.http_calls, 1)
+    equal(env:status().forward_mode, "uart")
+end
+
+function tests.main_binding_save_race_stays_owned_by_original_iccid()
+    local env = load_main({mode = "uart"}, nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    env.write_hook = function(key)
+        if key == "direct_sim_v1_1" then env.current_iccid = "898600000000002" end
+    end
+    equal(env:command("set_forward_config", config()).result, "error")
+    equal(env.storage.direct_sim_v1_1.iccid, message().iccid)
+    env.events.SMS_INC("10086", "new SIM during save")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+    equal(env:status().forward_mode, "uart")
+end
+
+function tests.main_new_sim_does_not_inherit_another_sim_apn()
+    local settings = config()
+    settings.apn = "private-apn"
+    local env = load_main(settings, nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    equal(env.apn_calls[#env.apn_calls], "private-apn")
+    env:switch_sim("898600000000002")
+    equal(env.apn_calls[#env.apn_calls], "")
+    equal(#env.http_calls, 0)
+end
+
+function tests.main_old_number_queue_stays_blocked_after_rebinding_same_iccid()
+    local env = load_main(config(), nil, {use_real_direct = true})
+    env:resume_tasks(3)
+    env.events.SMS_INC("10086", "old-number pending")
+    env.current_number = "13900139000"
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+    equal(env:command("set_forward_config", config()).result, "ok")
+    env.events.SMS_INC("10086", "new-number pending")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 1)
+    assert(json.decode(env.http_calls[1].body).body:find("new-number pending", 1, true))
+    env.current_number = ""
+    env.time = env.time + 10
+    env.events.SMS_INC("10086", "number temporarily unavailable")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 1)
+    equal(env:status().forward_mode, "uart")
+end
+
+function tests.main_invalid_binding_falls_back_to_host_without_spending_data()
     local invalid = config()
     invalid.mode = "unexpected-mode"
     local env = load_main({mode = "uart", channels = {}}, nil,
-        {use_real_direct = true, storage = {direct_config_v1 = invalid}})
-    equal(env.loaded, false)
-    assert(not tostring(env.load_error):find(default_channel.key, 1, true))
+        {use_real_direct = true, storage = {direct_sim_v1_1 = {iccid = message().iccid, number = "", config = invalid}}})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    equal(env:status().forward_mode, "uart")
+    equal(env:command("get_forward_config").result, "error")
     equal(#env.http_calls, 0)
 end
 

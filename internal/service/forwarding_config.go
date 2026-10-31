@@ -18,10 +18,12 @@ import (
 )
 
 const MaxForwardingConfigBytes = 3800
+const MaxForwardingBindings = 4
 
 var (
 	ErrForwardingConfigInvalid      = errors.New("独立转发配置无效")
 	ErrForwardingConfigNotPersisted = errors.New("板子未确认持久保存配置")
+	ErrForwardingBindingLimit       = errors.New("板子最多保存 4 条 SIM 绑定，请先删除不再使用的绑定")
 	forwardingChannelID             = regexp.MustCompile(`^[A-Za-z0-9_-]{1,40}$`)
 )
 
@@ -59,8 +61,22 @@ type ForwardingChannel struct {
 }
 
 type ForwardingConfigState struct {
-	Config    ForwardingConfig `json:"config"`
-	Persisted bool             `json:"persisted"`
+	Config        ForwardingConfig    `json:"config"`
+	Persisted     bool                `json:"persisted"`
+	SIMBound      bool                `json:"sim_bound"`
+	BoundICCID    string              `json:"bound_iccid"`
+	BoundNumber   string              `json:"bound_number"`
+	BindingLimit  int                 `json:"binding_limit"`
+	Bindings      []ForwardingBinding `json:"bindings"`
+	LegacyUnbound bool                `json:"legacy_unbound"`
+}
+
+// Only identity summaries may cross SIM boundaries. Channel credentials remain
+// accessible solely in the verified current SIM's Config.
+type ForwardingBinding struct {
+	ICCID  string `json:"iccid"`
+	Number string `json:"number"`
+	Mode   string `json:"mode"`
 }
 
 func ValidateForwardingConfig(config ForwardingConfig) error {
@@ -169,7 +185,7 @@ func supportsForwardingConfigProtocol(version string) bool {
 		}
 		parsed[i] = value
 	}
-	return parsed[0] > 1 || parsed[0] == 1 && parsed[1] >= 6
+	return parsed[0] > 1 || parsed[0] == 1 && parsed[1] >= 7
 }
 
 func (m *SerialManager) GetForwardingConfig(ctx context.Context, simID string) (*ForwardingConfigState, error) {
@@ -195,6 +211,37 @@ func (m *SerialManager) SetForwardingConfig(ctx context.Context, simID string, c
 }
 
 func (s *SerialService) forwardingConfig(ctx context.Context, expected SIMIdentity, wanted *ForwardingConfig) (*ForwardingConfigState, error) {
+	return s.forwardingConfigOperation(ctx, expected, wanted, "")
+}
+
+func (m *SerialManager) DeleteForwardingConfig(ctx context.Context, simID, iccid string) (*ForwardingConfigState, error) {
+	if strings.TrimSpace(simID) == "" || simID == UnassignedSIMID {
+		return nil, ErrSIMIdentityRequired
+	}
+	iccid = normalizeIdentityValue(iccid)
+	if !validForwardingBindingICCID(iccid) {
+		return nil, fmt.Errorf("%w: 必须提供要删除绑定的有效 ICCID", ErrForwardingConfigInvalid)
+	}
+	s, expected, err := m.resolveLiveSIM(simID)
+	if err != nil {
+		return nil, err
+	}
+	return s.forwardingConfigOperation(ctx, expected, nil, iccid)
+}
+
+func validForwardingBindingICCID(iccid string) bool {
+	if len(iccid) == 0 || len(iccid) > 32 {
+		return false
+	}
+	for _, char := range iccid {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *SerialService) forwardingConfigOperation(ctx context.Context, expected SIMIdentity, wanted *ForwardingConfig, deleteICCID string) (*ForwardingConfigState, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -207,7 +254,7 @@ func (s *SerialService) forwardingConfig(ctx context.Context, expected SIMIdenti
 				return err
 			}
 			if !supportsForwardingConfigProtocol(s.rememberScriptVersion("")) {
-				return fmt.Errorf("%w: 修改独立转发配置需要 main.lua 1.6.0 或更高版本", ErrSIMProtocolOutdated)
+				return fmt.Errorf("%w: 安全的 SIM 绑定转发配置需要 main.lua 1.7.0 或更高版本", ErrSIMProtocolOutdated)
 			}
 			validator, _ := s.getSIMRouteCallbacks()
 			if validator != nil {
@@ -220,16 +267,28 @@ func (s *SerialService) forwardingConfig(ctx context.Context, expected SIMIdenti
 		if err := validateRoute(); err != nil {
 			return err
 		}
-		if wanted != nil {
+		if wanted != nil || deleteICCID != "" {
 			if s.hasPendingSMS() {
 				return ErrSMSOperationPending
 			}
-			payload, err := s.forwardingCommand(ctx, map[string]any{"action": "set_forward_config", "expected_iccid": expected.ICCID, "config": *wanted})
+			command := map[string]any{"action": "delete_forward_config", "expected_iccid": expected.ICCID, "delete_iccid": deleteICCID}
+			if wanted != nil {
+				command = map[string]any{"action": "set_forward_config", "expected_iccid": expected.ICCID, "config": *wanted}
+			}
+			payload, err := s.forwardingCommand(ctx, command)
 			if err != nil {
 				return err
 			}
-			if persisted, _ := payload["persisted"].(bool); !persisted {
-				return ErrForwardingConfigNotPersisted
+			if wanted != nil {
+				if persisted, _ := payload["persisted"].(bool); !persisted {
+					return ErrForwardingConfigNotPersisted
+				}
+				if bound, _ := payload["sim_bound"].(bool); !bound {
+					return ErrForwardingConfigNotPersisted
+				}
+				if iccid, _ := payload["bound_iccid"].(string); iccid != expected.ICCID {
+					return ErrSIMMismatch
+				}
 			}
 		}
 		if err := validateRoute(); err != nil {
@@ -239,44 +298,104 @@ func (s *SerialService) forwardingConfig(ctx context.Context, expected SIMIdenti
 		if err != nil {
 			return err
 		}
-		configuration, ok := payload["config"].(map[string]interface{})
-		if !ok {
-			return fmt.Errorf("%w: 设备未返回配置", ErrControlCommandRejected)
-		}
-		// LuatOS encodes an empty Lua table as {}, including an empty channels list.
-		if empty, ok := configuration["channels"].(map[string]interface{}); ok && len(empty) == 0 {
-			configuration["channels"] = []ForwardingChannel{}
-		}
-		encoded, err := json.Marshal(configuration)
+		result, err := decodeForwardingConfigState(payload, expected.ICCID)
 		if err != nil {
-			return fmt.Errorf("%w: 设备返回的配置无效", ErrControlCommandRejected)
+			return err
 		}
-		var result ForwardingConfigState
-		decoder := json.NewDecoder(bytes.NewReader(encoded))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&result.Config); err != nil {
-			return fmt.Errorf("%w: 设备返回的配置无法解析", ErrControlCommandRejected)
-		}
-		if err := ValidateForwardingConfig(result.Config); err != nil {
-			return fmt.Errorf("%w: 设备返回的配置未通过校验", ErrControlCommandRejected)
-		}
-		result.Persisted, _ = payload["persisted"].(bool)
-		if wanted != nil && (!result.Persisted || !reflect.DeepEqual(result.Config, *wanted)) {
+		if wanted != nil && (!result.SIMBound || !result.Persisted || !reflect.DeepEqual(result.Config, *wanted)) {
 			return fmt.Errorf("%w: 保存后的回读不一致，请重新读取设备确认", ErrForwardingConfigNotPersisted)
+		}
+		for _, binding := range result.Bindings {
+			if deleteICCID != "" && binding.ICCID == deleteICCID {
+				return fmt.Errorf("%w: 删除后的绑定仍存在，请重新读取设备确认", ErrForwardingConfigNotPersisted)
+			}
 		}
 		if err := validateRoute(); err != nil {
 			return err
 		}
-		state = &result
+		state = result
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if wanted != nil {
+	if wanted != nil || deleteICCID != "" {
 		s.RequestCacheUpdate()
 	}
 	return state, nil
+}
+
+func decodeForwardingConfigState(payload map[string]interface{}, expectedICCID string) (*ForwardingConfigState, error) {
+	rejected := func() (*ForwardingConfigState, error) {
+		return nil, fmt.Errorf("%w: 设备返回的 SIM 绑定配置无效", ErrControlCommandRejected)
+	}
+	configuration, ok := payload["config"].(map[string]interface{})
+	if !ok {
+		return rejected()
+	}
+	if empty, ok := configuration["channels"].(map[string]interface{}); ok && len(empty) == 0 {
+		configuration["channels"] = []ForwardingChannel{}
+	}
+	statePayload := map[string]interface{}{"config": configuration}
+	for _, name := range []string{"persisted", "sim_bound", "legacy_unbound"} {
+		value, ok := payload[name].(bool)
+		if !ok {
+			return rejected()
+		}
+		statePayload[name] = value
+	}
+	for _, name := range []string{"bound_iccid", "bound_number"} {
+		value, ok := payload[name].(string)
+		if !ok {
+			return rejected()
+		}
+		statePayload[name] = value
+	}
+	statePayload["binding_limit"] = payload["binding_limit"]
+	bindings, exists := payload["bindings"]
+	if !exists {
+		return rejected()
+	}
+	if empty, ok := bindings.(map[string]interface{}); ok && len(empty) == 0 {
+		bindings = []ForwardingBinding{}
+	}
+	statePayload["bindings"] = bindings
+	encoded, err := json.Marshal(statePayload)
+	if err != nil {
+		return rejected()
+	}
+	var state ForwardingConfigState
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil || state.BindingLimit != MaxForwardingBindings ||
+		state.Bindings == nil || len(state.Bindings) > MaxForwardingBindings || ValidateForwardingConfig(state.Config) != nil {
+		return rejected()
+	}
+	seen, currentFound := make(map[string]bool), false
+	for _, binding := range state.Bindings {
+		if !validForwardingBindingICCID(binding.ICCID) || seen[binding.ICCID] ||
+			(binding.Mode != "uart" && binding.Mode != "direct") || len(binding.Number) > 64 {
+			return rejected()
+		}
+		seen[binding.ICCID] = true
+		if binding.ICCID == expectedICCID {
+			currentFound = true
+			if state.SIMBound && (binding.Mode != state.Config.Mode || binding.Number != state.BoundNumber) {
+				return rejected()
+			}
+		}
+	}
+	if state.SIMBound {
+		if state.BoundICCID != expectedICCID {
+			return nil, ErrSIMMismatch
+		}
+		if !state.Persisted || !currentFound {
+			return nil, ErrForwardingConfigNotPersisted
+		}
+	} else if state.Persisted || state.BoundICCID != "" || state.BoundNumber != "" || state.Config.Mode != "uart" {
+		return nil, ErrForwardingConfigNotPersisted
+	}
+	return &state, nil
 }
 
 func (s *SerialService) forwardingCommand(ctx context.Context, command map[string]any) (map[string]interface{}, error) {
@@ -310,6 +429,8 @@ func (s *SerialService) forwardingCommand(ctx context.Context, command map[strin
 				return nil, ErrSMSOperationPending
 			case "storage_unavailable", "storage_write_failed", "storage_verify_failed":
 				return nil, ErrForwardingConfigNotPersisted
+			case "binding_limit_reached":
+				return nil, ErrForwardingBindingLimit
 			default:
 				return nil, fmt.Errorf("%w: 板子拒绝配置操作，请检查渠道、存储和脚本版本", ErrControlCommandRejected)
 			}

@@ -34,3 +34,6 @@ export const getForwardingConfig = (simId: string) =>
 export const saveForwardingConfig = (simId: string, config: ForwardingConfig) =>
   apiClient.put<ForwardingConfigResponse>('/serial/forwarding', {simId, config});
 
+export const deleteForwardingBinding = (simId: string, iccid: string) =>
+  apiClient.delete<ForwardingConfigResponse>('/serial/forwarding', {params: {simId, iccid}});
+

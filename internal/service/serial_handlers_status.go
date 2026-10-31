@@ -26,6 +26,9 @@ type StatusData struct {
 	ForwardMode             string             `json:"forward_mode"`
 	ForwardConfigSupported  bool               `json:"forward_config_supported"`
 	ForwardConfigPersisted  bool               `json:"forward_config_persisted"`
+	ForwardBindingSupported bool               `json:"forward_binding_supported"`
+	ForwardBoundICCID       string             `json:"forward_bound_iccid"`
+	ForwardBindingRequired  bool               `json:"forward_binding_required"`
 	DirectForward           DirectForwardStats `json:"direct_forward"`
 	Mobile                  struct {
 		IsRegistered            bool    `json:"is_registered"`

@@ -1,14 +1,14 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.6.1
+-- VERSION: 1.7.0
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 log.info("main", PROJECT, VERSION)
 
@@ -26,29 +26,48 @@ if not config_ok then
 end
 assert(type(forward_config) == "table" and
     (forward_config.mode == "uart" or forward_config.mode == "direct"), "forward_config.mode 必须为 uart 或 direct")
-local forwarding_config_key = "direct_config_v1"
-local forward_config_persisted = false
+local forwarding_module = require("direct_forward")
+local unbound_forward_config = assert(forwarding_module.validate_config({mode = "uart", channels = {}}))
+local legacy_unbound_config = forward_config.mode == "direct"
+-- 旧板载设置和脚本默认值没有可靠的 SIM 归属，升级时绝不自动认领。
+forward_config = unbound_forward_config
+local binding_limit = 4
+local forwarding_bindings = {}
+local function binding_key(slot) return "direct_sim_v1_" .. slot end
+local function valid_iccid(value)
+    return type(value) == "string" and #value >= 10 and #value <= 22 and value:match("^%d+$") ~= nil
+end
 local config_store_ready = false
+local binding_store_error = false
 if fskv and fskv.init and fskv.get and fskv.set and fskv.del then
     local initialized, result = pcall(fskv.init)
     config_store_ready = initialized and result == true
     if config_store_ready then
-        local loaded, saved = pcall(fskv.get, forwarding_config_key)
-        if not loaded then error("无法读取板载转发设置") end
-        if saved ~= nil then
-            local normalized = require("direct_forward").validate_config(saved)
-            if not normalized then error("板载转发设置无效，请检查 Flash 配置") end
-            forward_config, forward_config_persisted = normalized, true
+        local old_ok, old = pcall(fskv.get, "direct_config_v1")
+        legacy_unbound_config = legacy_unbound_config or (old_ok and old ~= nil)
+        local seen = {}
+        for slot = 1, binding_limit do
+            local loaded, saved = pcall(fskv.get, binding_key(slot))
+            if not loaded then binding_store_error = true end
+            if loaded and saved ~= nil then
+                local normalized = type(saved) == "table" and valid_iccid(saved.iccid) and
+                    type(saved.number) == "string" and #saved.number <= 64 and
+                    forwarding_module.validate_config(saved.config)
+                if not normalized or seen[saved.iccid] then
+                    binding_store_error = true
+                else
+                    saved.config = normalized
+                    forwarding_bindings[slot], seen[saved.iccid] = saved, true
+                end
+            end
         end
     end
 end
-local forward_mode = forward_config.mode
+local forward_mode = "uart"
 local direct_forward = nil
+local engine_owner_iccid = ""
 local direct_inflight = false
 local uart_host_seen = false
-if forward_mode == "direct" and type(forward_config.apn) == "string" and forward_config.apn ~= "" then
-    mobile.apn(0, 1, forward_config.apn)
-end
 
 -- 2. 全局配置与变量
 -- [注意] 如果接单片机物理引脚，通常是 uart.UART_1；如果是USB调试，用 uart.VUART_0
@@ -387,6 +406,7 @@ local function capture_incoming_identity()
         stable_identity_equal(first, second) and
         stable_identity_equal(cached, second)
     if verified then
+        cached.number = second.number
         return cached, nil
     end
 
@@ -406,27 +426,67 @@ local function capture_incoming_identity()
     return snapshot, reason
 end
 
+local function binding_for_identity(identity)
+    if binding_store_error or not config_store_ready or not identity or
+       not identity.identity_valid or not identity.sim_ready then return nil end
+    for slot = 1, binding_limit do
+        local binding = forwarding_bindings[slot]
+        if binding and binding.iccid == identity.iccid then
+            -- 保存过号码时须再次确认一致；从未能读出号码的卡以 ICCID 识别。
+            if binding.number ~= "" and binding.number ~= identity.number then
+                return nil
+            end
+            return binding, slot
+        end
+    end
+end
+
+local function mode_for_identity(identity)
+    local binding = binding_for_identity(identity)
+    return binding and binding.config.mode or "uart"
+end
+
 local function create_direct_forwarder(config)
-    if config.mode ~= "direct" then return nil end
-    return require("direct_forward").new(config, {
-        can_send = function(iccid)
+    return forwarding_module.new(config, {
+        can_send = function(iccid, receiver)
             -- 队列归属在接收时冻结。换卡后不能让新 SIM 为旧 SIM 的通知付流量。
-            if flymode_requested or not active_identity.identity_valid or active_identity.iccid ~= iccid then
+            if flymode_requested or engine_owner_iccid ~= iccid or
+               not active_identity.identity_valid or active_identity.iccid ~= iccid or
+               mode_for_identity(active_identity) ~= "direct" then
                 return false
             end
             local candidate = read_identity_candidate()
-            return candidate ~= nil and candidate.iccid == iccid
+            return candidate ~= nil and candidate.iccid == iccid and mode_for_identity(candidate) == "direct" and
+                (not receiver or receiver == "" or candidate.number == receiver)
         end,
     })
 end
 
-if forward_mode == "direct" then
-    direct_forward = create_direct_forwarder(forward_config)
-    log.info("Forward", "direct 独立模式", json.encode(direct_forward:status()))
+-- 只有一个引擎拥有队列和累计统计。换卡仅热更新活动配置，避免重建丢失 RAM 队列。
+direct_forward = create_direct_forwarder(unbound_forward_config)
+local function refresh_forwarding()
+    if direct_inflight then return end
+    local binding = binding_for_identity(active_identity)
+    local current = binding and binding.config or unbound_forward_config
+    local owner = binding and binding.iccid or ""
+    if forward_config ~= current or engine_owner_iccid ~= owner then
+        direct_forward:flush()
+        local previous_apn = forward_config.apn
+        forward_config, engine_owner_iccid = current, owner
+        local configured = direct_forward:configure(current)
+        forward_mode = configured and current.mode or "uart"
+        if (forward_mode == "direct" or previous_apn ~= current.apn) and type(mobile.apn) == "function" then
+            -- 换成未绑定/主机模式的卡时也撤销旧 APN，不能沿用另一张卡的接入设置。
+            pcall(mobile.apn, 0, 1, current.apn)
+        end
+    end
 end
 
 local function forwarding_status()
-    return direct_forward and direct_forward:status() or nil
+    local status = direct_forward:status()
+    status.enabled = status.enabled and mode_for_identity(active_identity) == "direct" and
+        engine_owner_iccid == active_identity.iccid
+    return status
 end
 
 local function get_mobile_info()
@@ -564,63 +624,96 @@ local function equal_config(left, right)
 end
 
 local function process_forward_config_command(command)
-    local function respond(result, reason, config)
+    local response_identity = copy_identity(active_identity)
+    local function respond(result, reason)
+        local binding = result == "ok" and binding_for_identity(response_identity) or nil
+        local summaries = {}
+        for slot = 1, binding_limit do
+            local item = forwarding_bindings[slot]
+            if item then summaries[#summaries + 1] = {iccid = item.iccid, number = item.number, mode = item.config.mode} end
+        end
         send_to_uart({type = "cmd_response", action = command.action, request_id = command.request_id,
-            result = result, error = reason, config = config,
-            persisted = result == "ok" and forward_config_persisted or false}, true)
+            result = result, error = reason,
+            config = result == "ok" and (binding and binding.config or unbound_forward_config) or nil,
+            persisted = binding ~= nil, sim_bound = binding ~= nil,
+            bound_iccid = binding and binding.iccid or "", bound_number = binding and binding.number or "",
+            binding_limit = binding_limit, bindings = summaries,
+            legacy_unbound = binding == nil and legacy_unbound_config or false}, true)
     end
     if type(command.request_id) ~= "string" or #command.request_id == 0 then
         respond("error", "request_id_required")
         return
     end
-    local identity_ok, _, identity_error = verify_control_identity(command.expected_iccid)
+    local identity_ok, identity, identity_error = verify_control_identity(command.expected_iccid)
     if not identity_ok then respond("error", identity_error); return end
-    local module_ok, module = pcall(require, "direct_forward")
-    if not module_ok or type(module.validate_config) ~= "function" then
-        respond("error", "forward_config_module_unavailable")
-        return
-    end
+    response_identity = identity
+    if binding_store_error then respond("error", "storage_unavailable"); return end
     if command.action == "get_forward_config" then
-        local current, reason = module.validate_config(forward_config)
-        if not current then respond("error", reason); return end
-        respond("ok", nil, current)
+        respond("ok")
         return
     end
     if direct_inflight then respond("error", "direct_forward_busy"); return end
     if sms_send_active or #send_queue > 0 then respond("error", "sms_operation_pending"); return end
-    local normalized, validation_error = module.validate_config(command.config)
-    if not normalized then respond("error", validation_error); return end
     if not config_store_ready then respond("error", "storage_unavailable"); return end
-
-    -- 先准备候选引擎；无网络请求，旧配置在 Flash 校验成功前仍继续有效。
-    if direct_forward then direct_forward:flush() end
-    local prepared, candidate = pcall(create_direct_forwarder, normalized)
-    if not prepared or (normalized.mode == "direct" and (not candidate or not candidate:status().enabled or
-        not candidate:status().storage_available)) then
-        respond("error", "direct_forward_unavailable")
+    local target_iccid = command.action == "delete_forward_config" and command.delete_iccid or identity.iccid
+    if not valid_iccid(target_iccid) then respond("error", "invalid_binding_iccid"); return end
+    local slot, free_slot
+    for index = 1, binding_limit do
+        local item = forwarding_bindings[index]
+        if item and item.iccid == target_iccid then slot = index end
+        if not item and not free_slot then free_slot = index end
+    end
+    if command.action == "delete_forward_config" then
+        if slot then
+            local removed, result = pcall(fskv.del, binding_key(slot))
+            if not removed or result ~= true then respond("error", "storage_write_failed"); return end
+            local read_ok, readback = pcall(fskv.get, binding_key(slot))
+            if not read_ok or readback ~= nil then
+                binding_store_error = true
+                respond("error", "storage_verify_failed")
+                return
+            end
+            forwarding_bindings[slot] = nil
+        end
+        refresh_forwarding()
+        respond("ok")
         return
     end
-    local previous_ok, previous = pcall(fskv.get, forwarding_config_key)
+    local normalized, validation_error = forwarding_module.validate_config(command.config)
+    if not normalized then respond("error", validation_error); return end
+    slot = slot or free_slot
+    if not slot then respond("error", "binding_limit_reached"); return end
+    if normalized.mode == "direct" and (not http or type(http.request) ~= "function" or
+        not socket or socket.LWIP_GP == nil or not direct_forward:status().storage_available) then
+        respond("error", "direct_forward_unavailable"); return
+    end
+    local saved = {iccid = identity.iccid, number = identity.number or "", config = normalized}
+    local encoded_ok, encoded = pcall(json.encode, saved)
+    if not encoded_ok or type(encoded) ~= "string" or #encoded > 3950 then
+        respond("error", "config_too_large"); return
+    end
+    local previous_ok, previous = pcall(fskv.get, binding_key(slot))
     if not previous_ok then respond("error", "storage_unavailable"); return end
-    local written, result = pcall(fskv.set, forwarding_config_key, normalized)
+    local written, result = pcall(fskv.set, binding_key(slot), saved)
     if not written or result ~= true then respond("error", "storage_write_failed"); return end
-    local verified, readback = pcall(fskv.get, forwarding_config_key)
-    if not verified or not equal_config(readback, normalized) then
+    local verified, readback = pcall(fskv.get, binding_key(slot))
+    if not verified or not equal_config(readback, saved) then
         -- 校验失败时尽可能恢复上一份设置，不能对未确认保存的配置报告成功。
         local rolled_back, rollback_result
-        if previous == nil then rolled_back, rollback_result = pcall(fskv.del, forwarding_config_key)
-        else rolled_back, rollback_result = pcall(fskv.set, forwarding_config_key, previous) end
-        if not rolled_back or rollback_result ~= true then forward_config_persisted = false end
+        if previous == nil then rolled_back, rollback_result = pcall(fskv.del, binding_key(slot))
+        else rolled_back, rollback_result = pcall(fskv.set, binding_key(slot), previous) end
+        if not rolled_back or rollback_result ~= true then binding_store_error = true end
         respond("error", "storage_verify_failed")
         return
     end
-    forward_config, forward_mode, direct_forward = normalized, normalized.mode, candidate
-    forward_config_persisted = true
-    if forward_mode == "direct" and type(mobile.apn) == "function" then
-        -- 部分固件的 APN 仅在下次 PDP 激活后生效；保存值始终在重启时加载。
-        pcall(mobile.apn, 0, 1, forward_config.apn)
+    forwarding_bindings[slot] = saved
+    refresh_forwarding()
+    local current = read_identity_candidate()
+    if not stable_identity_equal(identity, current) then
+        respond("error", "sim_identity_mismatch")
+        return
     end
-    respond("ok", nil, forward_config)
+    respond("ok")
 end
 
 function process_uart_command(cmd_data)
@@ -629,7 +722,8 @@ function process_uart_command(cmd_data)
         return
     end
 
-    if cmd_data.action == "get_forward_config" or cmd_data.action == "set_forward_config" then
+    if cmd_data.action == "get_forward_config" or cmd_data.action == "set_forward_config" or
+       cmd_data.action == "delete_forward_config" then
         process_forward_config_command(cmd_data)
     elseif cmd_data.action == "send_sms" and
        type(cmd_data.to) == "string" and type(cmd_data.content) == "string" then
@@ -685,14 +779,19 @@ function process_uart_command(cmd_data)
         if not flymode_requested then
             request_identity_refresh("status_query", "REFRESH", nil)
         end
+        refresh_forwarding()
+        local binding = binding_for_identity(active_identity)
         local status = {
             type = "status_response",
             timestamp = os.time(),
             mem_kb = math.floor(collectgarbage("count")),
             version = VERSION,
-            forward_mode = forward_mode,
+            forward_mode = mode_for_identity(active_identity),
             forward_config_supported = true,
-            forward_config_persisted = forward_config_persisted,
+            forward_config_persisted = binding ~= nil,
+            forward_binding_supported = true,
+            forward_bound_iccid = binding and binding.iccid or "",
+            forward_binding_required = binding == nil,
             direct_forward = forwarding_status(),
             flymode_owner_iccid = flymode_requested and flymode_owner_iccid or "",
             flymode_source = flymode_requested and flymode_source or "",
@@ -704,7 +803,7 @@ function process_uart_command(cmd_data)
 
     elseif cmd_data.action == "get_forward_stats" then
         send_to_uart({type = "cmd_response", action = "get_forward_stats", result = "ok",
-            forward_mode = forward_mode, direct_forward = forwarding_status()}, true)
+            forward_mode = mode_for_identity(active_identity), direct_forward = forwarding_status()}, true)
 
     elseif cmd_data.action == "ack_sms" and cmd_data.message_id then
         sys.publish("SMS_ACK_" .. tostring(cmd_data.message_id))
@@ -722,7 +821,7 @@ function process_uart_command(cmd_data)
         -- 设备端也做互斥：即使主机在检查后崩溃或有其他控制端，
         -- 也不能用飞行模式中断已排队/正在提交的短信。
         if sms_send_active or #send_queue > 0 or direct_inflight or
-            (forward_mode == "direct" and flymode_enabled and cmd_data.source == "automatic") then
+            (mode_for_identity(active_identity) == "direct" and flymode_enabled and cmd_data.source == "automatic") then
             local response = {
                 type = "cmd_response",
                 action = "set_flymode",
@@ -987,11 +1086,14 @@ sys.subscribe("SMS_INC", function(phone, content)
         timestamp = os.time(),
         from = phone,
         content = content,
-        forward_mode = forward_mode,
+        forward_mode = mode_for_identity(snapshot),
         identity_error = identity_error
     }
     attach_identity(msg, snapshot)
-    if direct_forward then direct_forward:enqueue(msg) end
+    if msg.forward_mode == "direct" then
+        refresh_forwarding()
+        direct_forward:enqueue(msg, binding_for_identity(snapshot).config)
+    end
     table.insert(msg_buffer, msg)
     if #msg_buffer > max_buffer_size then
         table.remove(msg_buffer, 1) -- 移除旧的
@@ -1046,13 +1148,16 @@ sys.subscribe("CC_IND", function(state)
             local call = {
                 type = "incoming_call",
                 message_id = next_message_id(),
-                forward_mode = forward_mode,
+                forward_mode = mode_for_identity(call_identity),
                 timestamp = os.time(),
                 from = phone_num or "unknown",
                 identity_error = identity_error
             }
             attach_identity(call, active_call_identity)
-            if direct_forward then direct_forward:enqueue(call) end
+            if call.forward_mode == "direct" then
+                refresh_forwarding()
+                direct_forward:enqueue(call, binding_for_identity(call_identity).config)
+            end
             send_to_uart(call)
         end
 
@@ -1085,6 +1190,7 @@ end)
 -- 即使开机是 uart 模式，也保留本地调度器供串口保存后立即启用 direct。
 sys.taskInit(function()
         while true do
+            refresh_forwarding()
             if direct_forward then
                 direct_inflight = true
                 local ok = pcall(function() direct_forward:step() end)
@@ -1276,7 +1382,7 @@ sys.taskInit(function()
         end
         while #msg_buffer > 0 do
             local msg = msg_buffer[1]
-            if forward_mode == "direct" and not uart_host_seen then
+            if msg and msg.forward_mode == "direct" and not uart_host_seen then
                 sys.wait(1000)
             elseif msg then
                 -- 身份在 SMS_INC 发生时即被冻结；若当时无法确认则保持未归属，
@@ -1295,7 +1401,7 @@ sys.taskInit(function()
                         -- 主机可能暂时离线，保留消息并稍后重试。
                         table.remove(msg_buffer, 1)
                         table.insert(msg_buffer, msg)
-                        if forward_mode == "uart" then
+                        if msg.forward_mode == "uart" then
                             log.warn("UART", "短信未收到主机确认，将重试", msg.message_id)
                         end
                         sys.wait(1000)
@@ -1315,8 +1421,8 @@ sys.taskInit(function()
         type = "system_ready",
         project = PROJECT,
         version = VERSION,
-        data_disabled = forward_mode == "uart",
-        forward_mode = forward_mode,
+        data_disabled = mode_for_identity(active_identity) == "uart",
+        forward_mode = mode_for_identity(active_identity),
         direct_forward = forwarding_status(),
     }
     attach_identity(ready, active_identity)

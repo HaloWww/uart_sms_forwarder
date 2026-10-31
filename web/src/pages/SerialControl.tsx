@@ -224,7 +224,7 @@ export default function SerialControl() {
                                         <p className="mt-2 text-xs leading-5 text-slate-500">独立模式由 Air780 使用 SIM 数据流量发送通知；连接主机后仍保存短信，但不重复推送。统计为该模块 HTTP 请求期间的蜂窝流量增量，包含重试和 token 请求，可能包含同期其他网络流量，不等同于运营商账单。累计值属于模块，不按 SIM 分卡统计。</p>
                                         {directForward && !directForward.counter_available && <p className="mt-2 text-xs leading-5 text-amber-700">上方保留已记录的历史累计；重启后尚未请求、固件不支持或计数暂不可用时，无法测量的新请求流量不会计入累计，0 B 也不代表实际没有消耗流量。</p>}
                                         {directForward && directForward.unmetered_requests > 0 && <p className="mt-2 text-xs leading-5 text-amber-700">有 {directForward.unmetered_requests} 次请求未能计量，累计流量不包含这些请求，实际消耗可能更高。</p>}
-                                        <p className="mt-2 text-xs leading-5 text-slate-500">新版脚本可通过下方“板载独立转发”保存渠道和格式到板子；“通知渠道”页面的配置仅用于主机转发模式。</p>
+                                        <p className="mt-2 text-xs leading-5 text-slate-500">新版脚本可通过下方“当前号码的转发设置”将渠道和格式绑定到当前 SIM；“通知渠道”页面的配置仅用于主机转发模式。</p>
                                         {directForward?.last_error && <p className="mt-2 break-words text-xs text-amber-700">最近转发错误：{directForward.last_error}</p>}
                                     </>}
                                 </section>
