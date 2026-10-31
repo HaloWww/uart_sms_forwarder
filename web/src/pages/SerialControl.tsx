@@ -51,6 +51,12 @@ function StatusTile({label, value, tone = 'slate'}: StatusTileProps) {
     );
 }
 
+function formatTraffic(bytes: number) {
+    if (bytes < 1024) return `${bytes.toLocaleString('zh-CN')} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KiB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
+}
+
 export default function SerialControl() {
     const {selectedSimId, selectedSim, isFetching, isLoading} = useSim();
     const queryClient = useQueryClient();
@@ -83,6 +89,7 @@ export default function SerialControl() {
     });
 
     const mobile = deviceStatus?.mobile;
+    const directForward = deviceStatus?.direct_forward;
     const connected = Boolean(selectedSim?.online && !selectedSim.conflict && deviceStatus?.connected);
     const controlReady = Boolean(
         connected && selectedSim && isAssignableSim(selectedSim) && selectedSimId &&
@@ -188,6 +195,30 @@ export default function SerialControl() {
                                             </div>
                                         ))}
                                     </div>
+                                </section>
+
+                                <section className="mt-5 border-t border-slate-100 pt-4">
+                                    <h3 className="mb-1 text-xs font-bold text-slate-800">转发模式与流量</h3>
+                                    <dl className="grid gap-x-8 sm:grid-cols-2">
+                                        <InfoRow label="转发模式" value={!connected ? unavailable : deviceStatus?.forward_mode === 'direct' ? 'SIM 流量独立转发' : 'Ubuntu / 主机转发'}/>
+                                        {connected && deviceStatus?.forward_mode === 'direct' && directForward && <>
+                                            <InfoRow label="待转发" value={directForward.queued.toLocaleString('zh-CN')}/>
+                                            <InfoRow label="已转发 / 失败 / 丢弃" value={`${directForward.sent} / ${directForward.failed} / ${directForward.dropped}`}/>
+                                            <InfoRow label="HTTP 请求次数" value={directForward.requests.toLocaleString('zh-CN')}/>
+                                            <InfoRow label="未计量请求" value={(directForward.unmetered_requests ?? 0).toLocaleString('zh-CN')}/>
+                                            <InfoRow label="估算累计流量" value={formatTraffic(directForward.total_bytes)}/>
+                                            <InfoRow label="估算上行 / 下行" value={`${formatTraffic(directForward.tx_bytes)} / ${formatTraffic(directForward.rx_bytes)}`}/>
+                                            <InfoRow label="当前流量计数" value={directForward.counter_available ? '最近请求已测量' : '尚未就绪或暂不可用'}/>
+                                            <InfoRow label="统计保存" value={directForward.storage_available ? '模块持久化' : '不可用或写入失败'}/>
+                                        </>}
+                                    </dl>
+                                    {connected && deviceStatus?.forward_mode === 'direct' && <>
+                                        <p className="mt-2 text-xs leading-5 text-slate-500">独立模式由 Air780 使用 SIM 数据流量发送通知；连接主机后仍保存短信，但不重复推送。统计为该模块 HTTP 请求期间的蜂窝流量增量，包含重试和 token 请求，可能包含同期其他网络流量，不等同于运营商账单。累计值属于模块，不按 SIM 分卡统计。</p>
+                                        {directForward && !directForward.counter_available && <p className="mt-2 text-xs leading-5 text-amber-700">上方保留已记录的历史累计；重启后尚未请求、固件不支持或计数暂不可用时，无法测量的新请求流量不会计入累计，0 B 也不代表实际没有消耗流量。</p>}
+                                        {directForward && directForward.unmetered_requests > 0 && <p className="mt-2 text-xs leading-5 text-amber-700">有 {directForward.unmetered_requests} 次请求未能计量，累计流量不包含这些请求，实际消耗可能更高。</p>}
+                                        <p className="mt-2 text-xs leading-5 text-slate-500">独立转发的渠道和格式在模块的 forward_config.lua 中配置，修改后需重新烧录；此处的主机通知渠道设置仅用于主机转发模式。</p>
+                                        {directForward?.last_error && <p className="mt-2 break-words text-xs text-amber-700">最近转发错误：{directForward.last_error}</p>}
+                                    </>}
                                 </section>
 
                                 <section className="mt-5 border-t border-slate-100 pt-4">

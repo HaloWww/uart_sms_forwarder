@@ -50,11 +50,16 @@ jobs:
             exit 1
           fi
 
-      - name: 安装 Yarn 和 UPX
+      - name: 安装 Yarn、UPX 和 Lua
         run: |
           npm install -g yarn
           sudo apt-get update
-          sudo apt-get install -y upx
+          sudo apt-get install -y upx lua5.3
+
+      - name: 校验设备脚本与独立转发逻辑
+        run: |
+          luac -p main.lua direct_forward.lua forward_config.lua
+          lua tests/lua/direct_forward_test.lua
 
       - name: 使用 Make 构建前后端（多平台）
         run: |
@@ -92,6 +97,9 @@ jobs:
             # 复制配置文件和设备脚本
             cp config.example.yaml ${RELEASE_DIR}/config.yaml
             cp main.lua ${RELEASE_DIR}/main.lua
+            cp direct_forward.lua ${RELEASE_DIR}/direct_forward.lua
+            cp forward_config.lua ${RELEASE_DIR}/forward_config.lua
+            cp README.md ${RELEASE_DIR}/README.md
 
             # Windows 使用资源管理器可直接解压的 zip，其他平台使用 tar.gz
             if [[ $PLATFORM == windows-* ]]; then
@@ -102,6 +110,11 @@ jobs:
 
             echo "✓ Packaged ${PLATFORM}"
           done
+
+          # direct 独立运行只需要设备脚本，不必下载上位机二进制。
+          mkdir -p uart_sms_forwarder-lua
+          cp main.lua direct_forward.lua forward_config.lua README.md uart_sms_forwarder-lua/
+          zip -rq uart_sms_forwarder-lua.zip uart_sms_forwarder-lua
 
           # 显示所有打包结果
           ls -lh uart_sms_forwarder-*.tar.gz uart_sms_forwarder-*.zip
@@ -120,5 +133,5 @@ jobs:
             SHA256SUMS
           fail_on_unmatched_files: true
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           generate_release_notes: true

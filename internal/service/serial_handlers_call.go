@@ -17,6 +17,7 @@ type IncomingCall struct {
 	IMEI          string `json:"imei"`
 	IdentityValid bool   `json:"identity_valid"`
 	IdentityError string `json:"identity_error"`
+	ForwardMode   string `json:"forward_mode"`
 }
 
 // handleIncomingCall 处理来电通知
@@ -31,6 +32,9 @@ func (s *SerialService) handleIncomingCall(msg *ParsedMessage) {
 		zap.String("from", call.From),
 		zap.String("identity_error", call.IdentityError),
 		zap.Int64("timestamp", call.Timestamp))
+	if call.ForwardMode == "direct" {
+		return
+	}
 
 	// 转换为通用通知消息并发送
 	iccid := normalizeIdentityValue(call.ICCID)

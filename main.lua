@@ -1,19 +1,38 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.4.0
+-- VERSION: 1.5.0
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 log.info("main", PROJECT, VERSION)
 
 -- 1. 引入必要库
 sys = require("sys")
+
+-- 默认仍由上位机转发。旧版只烧录 main.lua 时也保留 UART 模式。
+local config_ok, forward_config = pcall(require, "forward_config")
+if not config_ok then
+    if not tostring(forward_config):match("module ['\"]?forward_config['\"]? not found") then
+        error("forward_config 加载失败，请检查配置脚本")
+    end
+    log.warn("Forward", "未加载 forward_config，使用原有 uart 模式")
+    forward_config = {mode = "uart"}
+end
+assert(type(forward_config) == "table" and
+    (forward_config.mode == "uart" or forward_config.mode == "direct"), "forward_config.mode 必须为 uart 或 direct")
+local forward_mode = forward_config.mode
+local direct_forward = nil
+local direct_inflight = false
+local uart_host_seen = false
+if forward_mode == "direct" and type(forward_config.apn) == "string" and forward_config.apn ~= "" then
+    mobile.apn(0, 1, forward_config.apn)
+end
 
 -- 2. 全局配置与变量
 -- [注意] 如果接单片机物理引脚，通常是 uart.UART_1；如果是USB调试，用 uart.VUART_0
@@ -371,6 +390,24 @@ local function capture_incoming_identity()
     return snapshot, reason
 end
 
+if forward_mode == "direct" then
+    direct_forward = require("direct_forward").new(forward_config, {
+        can_send = function(iccid)
+            -- 队列归属在接收时冻结。换卡后不能让新 SIM 为旧 SIM 的通知付流量。
+            if flymode_requested or not active_identity.identity_valid or active_identity.iccid ~= iccid then
+                return false
+            end
+            local candidate = read_identity_candidate()
+            return candidate ~= nil and candidate.iccid == iccid
+        end,
+    })
+    log.info("Forward", "direct 独立模式", json.encode(direct_forward:status()))
+end
+
+local function forwarding_status()
+    return direct_forward and direct_forward:status() or nil
+end
+
 local function get_mobile_info()
     local info = copy_identity(active_identity)
     -- 使用 status 判断：0=未注册 1=已注册 2=搜索中 3=拒绝 5=漫游注册
@@ -534,6 +571,7 @@ function process_uart_command(cmd_data)
         send_to_uart(response, true)
 
     elseif cmd_data.action == "get_status" then
+        uart_host_seen = true
         if not flymode_requested then
             request_identity_refresh("status_query", "REFRESH", nil)
         end
@@ -542,6 +580,8 @@ function process_uart_command(cmd_data)
             timestamp = os.time(),
             mem_kb = math.floor(collectgarbage("count")),
             version = VERSION,
+            forward_mode = forward_mode,
+            direct_forward = forwarding_status(),
             flymode_owner_iccid = flymode_requested and flymode_owner_iccid or "",
             flymode_source = flymode_requested and flymode_source or "",
             manual_restore_owner_iccid = manual_restore_owner_iccid,
@@ -549,6 +589,10 @@ function process_uart_command(cmd_data)
         }
         attach_identity(status, active_identity)
         send_to_uart(status)
+
+    elseif cmd_data.action == "get_forward_stats" then
+        send_to_uart({type = "cmd_response", action = "get_forward_stats", result = "ok",
+            forward_mode = forward_mode, direct_forward = forwarding_status()}, true)
 
     elseif cmd_data.action == "ack_sms" and cmd_data.message_id then
         sys.publish("SMS_ACK_" .. tostring(cmd_data.message_id))
@@ -565,7 +609,8 @@ function process_uart_command(cmd_data)
 
         -- 设备端也做互斥：即使主机在检查后崩溃或有其他控制端，
         -- 也不能用飞行模式中断已排队/正在提交的短信。
-        if sms_send_active or #send_queue > 0 then
+        if sms_send_active or #send_queue > 0 or direct_inflight or
+            (forward_mode == "direct" and flymode_enabled and cmd_data.source == "automatic") then
             local response = {
                 type = "cmd_response",
                 action = "set_flymode",
@@ -738,7 +783,7 @@ function process_uart_command(cmd_data)
 
     elseif cmd_data.action == "reset_stack" then
         log.info("CMD", "重启协议栈")
-        if sms_send_active or #send_queue > 0 then
+        if sms_send_active or #send_queue > 0 or direct_inflight then
             local response = {
                 type = "cmd_response",
                 action = "reset_stack",
@@ -752,6 +797,7 @@ function process_uart_command(cmd_data)
         end
         identity_epoch = identity_epoch + 1
         local _, snapshot = commit_identity(unavailable_identity("resetting", true))
+        if direct_forward then direct_forward:flush() end
         mobile.reset()
         mobile.setAuto(0)
         request_identity_refresh("stack_reset", "REFRESH", nil)
@@ -761,7 +807,7 @@ function process_uart_command(cmd_data)
 
     elseif cmd_data.action == "reboot_mcu" then
         log.info("CMD", "重启模块")
-        if sms_send_active or #send_queue > 0 then
+        if sms_send_active or #send_queue > 0 or direct_inflight then
             local response = {
                 type = "cmd_response",
                 action = "reboot_mcu",
@@ -808,6 +854,7 @@ function process_uart_command(cmd_data)
                     sys.wait(10)
                 end
             end
+            if direct_forward then direct_forward:flush() end
             pm.reboot()
         end)
     else
@@ -828,9 +875,11 @@ sys.subscribe("SMS_INC", function(phone, content)
         timestamp = os.time(),
         from = phone,
         content = content,
+        forward_mode = forward_mode,
         identity_error = identity_error
     }
     attach_identity(msg, snapshot)
+    if direct_forward then direct_forward:enqueue(msg) end
     table.insert(msg_buffer, msg)
     if #msg_buffer > max_buffer_size then
         table.remove(msg_buffer, 1) -- 移除旧的
@@ -884,11 +933,14 @@ sys.subscribe("CC_IND", function(state)
             active_call_identity = call_identity
             local call = {
                 type = "incoming_call",
+                message_id = next_message_id(),
+                forward_mode = forward_mode,
                 timestamp = os.time(),
                 from = phone_num or "unknown",
                 identity_error = identity_error
             }
             attach_identity(call, active_call_identity)
+            if direct_forward then direct_forward:enqueue(call) end
             send_to_uart(call)
         end
 
@@ -917,6 +969,18 @@ end)
 -- =================================================================================
 -- 任务循环区
 -- =================================================================================
+
+if direct_forward then
+    sys.taskInit(function()
+        while true do
+            direct_inflight = true
+            local ok = pcall(function() direct_forward:step() end)
+            direct_inflight = false
+            if not ok then log.error("Forward", "独立转发任务异常，将继续处理后续消息") end
+            sys.wait(1000) -- 本地调度不产生网络包；空闲时不发送心跳或连通性探测。
+        end
+    end)
+end
 
 uart.on(uartid, "receive", function(id, len)
     local chunk = uart.read(id, len)
@@ -1099,7 +1163,9 @@ sys.taskInit(function()
         end
         while #msg_buffer > 0 do
             local msg = msg_buffer[1]
-            if msg then
+            if forward_mode == "direct" and not uart_host_seen then
+                sys.wait(1000)
+            elseif msg then
                 -- 身份在 SMS_INC 发生时即被冻结；若当时无法确认则保持未归属，
                 -- 不用稍后可能属于另一张卡的身份补写。
                 local queued = send_to_uart(msg)
@@ -1116,7 +1182,9 @@ sys.taskInit(function()
                         -- 主机可能暂时离线，保留消息并稍后重试。
                         table.remove(msg_buffer, 1)
                         table.insert(msg_buffer, msg)
-                        log.warn("UART", "短信未收到主机确认，将重试", msg.message_id)
+                        if forward_mode == "uart" then
+                            log.warn("UART", "短信未收到主机确认，将重试", msg.message_id)
+                        end
                         sys.wait(1000)
                     end
                 end
@@ -1134,7 +1202,9 @@ sys.taskInit(function()
         type = "system_ready",
         project = PROJECT,
         version = VERSION,
-        data_disabled = true
+        data_disabled = forward_mode == "uart",
+        forward_mode = forward_mode,
+        direct_forward = forwarding_status(),
     }
     attach_identity(ready, active_identity)
     send_to_uart(ready)

@@ -6,6 +6,17 @@ on:
   pull_request:
 
 jobs:
+  lua-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Lua runtime
+        run: sudo apt-get update && sudo apt-get install -y lua5.3
+      - name: Check firmware scripts and direct forwarding tests
+        run: |
+          luac -p main.lua direct_forward.lua forward_config.lua
+          lua tests/lua/direct_forward_test.lua
+
   test:
     strategy:
       matrix:

@@ -29,6 +29,7 @@ type IncomingSMS struct {
 	From             string `json:"from"`
 	Content          string `json:"content"`
 	Type             string `json:"type"`
+	ForwardMode      string `json:"forward_mode"`
 }
 
 func (r IncomingSMS) String() string {
@@ -143,8 +144,10 @@ func (s *SerialService) handleIncomingSMS(msg *ParsedMessage) {
 		s.ackIncomingSMS(sms.MessageID)
 	}
 
-	// 异步发送通知
-	go s.sendNotification(ctx, sms)
+	// direct 模式由模块负责通知；主机仍保存并 ACK，不能再次发送通知。
+	if sms.ForwardMode != "direct" {
+		go s.sendNotification(ctx, sms)
+	}
 }
 
 func (s *SerialService) ackIncomingSMS(messageID string) {

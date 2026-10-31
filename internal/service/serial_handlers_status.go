@@ -8,21 +8,23 @@ import (
 )
 
 type StatusData struct {
-	DeviceID                string `json:"device_id"`
-	DeviceName              string `json:"device_name"`
-	SIMID                   string `json:"sim_id"`
-	IMEI                    string `json:"imei"`
-	MUID                    string `json:"muid"`
-	SIMSlot                 int    `json:"sim_slot"`
-	IdentityValid           bool   `json:"identity_valid"`
-	IdentityRevision        uint64 `json:"identity_revision"`
-	IdentityState           string `json:"identity_state"`
-	FlymodeOwnerICCID       string `json:"flymode_owner_iccid"`
-	FlymodeSource           string `json:"flymode_source"`
-	ManualRestoreOwnerICCID string `json:"manual_restore_owner_iccid"`
-	Flymode                 bool   `json:"flymode"` // 设备当前是否为飞行模式
-	Type                    string `json:"type"`    // 消息类型
-	Version                 string `json:"version"` // Lua 脚本版本
+	DeviceID                string             `json:"device_id"`
+	DeviceName              string             `json:"device_name"`
+	SIMID                   string             `json:"sim_id"`
+	IMEI                    string             `json:"imei"`
+	MUID                    string             `json:"muid"`
+	SIMSlot                 int                `json:"sim_slot"`
+	IdentityValid           bool               `json:"identity_valid"`
+	IdentityRevision        uint64             `json:"identity_revision"`
+	IdentityState           string             `json:"identity_state"`
+	FlymodeOwnerICCID       string             `json:"flymode_owner_iccid"`
+	FlymodeSource           string             `json:"flymode_source"`
+	ManualRestoreOwnerICCID string             `json:"manual_restore_owner_iccid"`
+	Flymode                 bool               `json:"flymode"` // 设备当前是否为飞行模式
+	Type                    string             `json:"type"`    // 消息类型
+	Version                 string             `json:"version"` // Lua 脚本版本
+	ForwardMode             string             `json:"forward_mode"`
+	DirectForward           DirectForwardStats `json:"direct_forward"`
 	Mobile                  struct {
 		IsRegistered bool    `json:"is_registered"`
 		IsRoaming    bool    `json:"is_roaming"`
@@ -48,6 +50,24 @@ type StatusData struct {
 	statusEpoch uint64
 }
 
+// DirectForwardStats reports module-persisted totals; byte counts are cellular
+// counter deltas around HTTP attempts, not the operator's billing records.
+type DirectForwardStats struct {
+	Enabled           bool    `json:"enabled"`
+	Queued            uint64  `json:"queued"`
+	Sent              uint64  `json:"sent"`
+	Failed            uint64  `json:"failed"`
+	Dropped           uint64  `json:"dropped"`
+	Requests          uint64  `json:"requests"`
+	UnmeteredRequests uint64  `json:"unmetered_requests"`
+	TxBytes           float64 `json:"tx_bytes"`
+	RxBytes           float64 `json:"rx_bytes"`
+	TotalBytes        float64 `json:"total_bytes"`
+	CounterAvailable  bool    `json:"counter_available"`
+	StorageAvailable  bool    `json:"storage_available"`
+	LastError         string  `json:"last_error"`
+}
+
 func (s *SerialService) handleStatusResponse(msg *ParsedMessage) {
 	if !s.statusAccepting.Load() {
 		return
@@ -61,6 +81,9 @@ func (s *SerialService) handleStatusResponse(msg *ParsedMessage) {
 	statusData.DeviceID = s.deviceID
 	statusData.DeviceName = s.deviceName
 	statusData.Version = s.rememberScriptVersion(statusData.Version)
+	if statusData.ForwardMode != "direct" {
+		statusData.ForwardMode = "uart"
+	}
 	statusData.Mobile.Iccid = normalizeIdentityValue(statusData.Mobile.Iccid)
 	statusData.Mobile.Imsi = normalizeIdentityValue(statusData.Mobile.Imsi)
 	statusData.Mobile.Imei = normalizeIdentityValue(statusData.Mobile.Imei)

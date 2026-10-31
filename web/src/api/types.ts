@@ -73,6 +73,22 @@ export interface MobileInfo {
     uptime: number;              // 开机时长 (毫秒)
 }
 
+export interface DirectForwardStats {
+    enabled: boolean;
+    queued: number;
+    sent: number;
+    failed: number;
+    dropped: number;
+    requests: number;
+    unmetered_requests: number;
+    tx_bytes: number;
+    rx_bytes: number;
+    total_bytes: number;
+    counter_available: boolean;
+    storage_available: boolean;
+    last_error: string;
+}
+
 // 设备状态响应（来自 Lua 脚本的 status_response）
 export interface DeviceStatus {
     device_id: string;
@@ -88,6 +104,8 @@ export interface DeviceStatus {
     port_name: string;           // 串口名称
     connected: boolean;          // 串口连接状态
     version: string;             // Lua 版本
+    forward_mode?: 'uart' | 'direct';
+    direct_forward?: DirectForwardStats;
 }
 
 // 持久化 SIM 档案及其当前承载设备。SIM 离线时 currentStatus 为空，
