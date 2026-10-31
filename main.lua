@@ -1,14 +1,14 @@
 -- =================================================================================
 -- PROJECT: UART SMS Forwarder
 -- DEVICE:  Air780EHV
--- VERSION: 1.5.0
+-- VERSION: 1.6.0
 -- 协议说明：
 --   上行（MCU -> 模块）：CMD_START:{json}:CMD_END
 --   下行（模块 -> MCU）：SMS_START:{json}:SMS_END
 -- =================================================================================
 
 PROJECT = "uart_sms_forwarder"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 log.info("main", PROJECT, VERSION)
 
@@ -26,6 +26,22 @@ if not config_ok then
 end
 assert(type(forward_config) == "table" and
     (forward_config.mode == "uart" or forward_config.mode == "direct"), "forward_config.mode 必须为 uart 或 direct")
+local forwarding_config_key = "direct_config_v1"
+local forward_config_persisted = false
+local config_store_ready = false
+if fskv and fskv.init and fskv.get and fskv.set and fskv.del then
+    local initialized, result = pcall(fskv.init)
+    config_store_ready = initialized and result == true
+    if config_store_ready then
+        local loaded, saved = pcall(fskv.get, forwarding_config_key)
+        if not loaded then error("无法读取板载转发设置") end
+        if saved ~= nil then
+            local normalized = require("direct_forward").validate_config(saved)
+            if not normalized then error("板载转发设置无效，请检查 Flash 配置") end
+            forward_config, forward_config_persisted = normalized, true
+        end
+    end
+end
 local forward_mode = forward_config.mode
 local direct_forward = nil
 local direct_inflight = false
@@ -390,8 +406,9 @@ local function capture_incoming_identity()
     return snapshot, reason
 end
 
-if forward_mode == "direct" then
-    direct_forward = require("direct_forward").new(forward_config, {
+local function create_direct_forwarder(config)
+    if config.mode ~= "direct" then return nil end
+    return require("direct_forward").new(config, {
         can_send = function(iccid)
             -- 队列归属在接收时冻结。换卡后不能让新 SIM 为旧 SIM 的通知付流量。
             if flymode_requested or not active_identity.identity_valid or active_identity.iccid ~= iccid then
@@ -401,6 +418,10 @@ if forward_mode == "direct" then
             return candidate ~= nil and candidate.iccid == iccid
         end,
     })
+end
+
+if forward_mode == "direct" then
+    direct_forward = create_direct_forwarder(forward_config)
     log.info("Forward", "direct 独立模式", json.encode(direct_forward:status()))
 end
 
@@ -515,13 +536,83 @@ local function next_message_id()
     )
 end
 
+local function equal_config(left, right)
+    if type(left) ~= type(right) then return false end
+    if type(left) ~= "table" then return left == right end
+    for key, value in pairs(left) do if not equal_config(value, right[key]) then return false end end
+    for key in pairs(right) do if left[key] == nil then return false end end
+    return true
+end
+
+local function process_forward_config_command(command)
+    local function respond(result, reason, config)
+        send_to_uart({type = "cmd_response", action = command.action, request_id = command.request_id,
+            result = result, error = reason, config = config,
+            persisted = result == "ok" and forward_config_persisted or false}, true)
+    end
+    if type(command.request_id) ~= "string" or #command.request_id == 0 then
+        respond("error", "request_id_required")
+        return
+    end
+    local identity_ok, _, identity_error = verify_control_identity(command.expected_iccid)
+    if not identity_ok then respond("error", identity_error); return end
+    local module_ok, module = pcall(require, "direct_forward")
+    if not module_ok or type(module.validate_config) ~= "function" then
+        respond("error", "forward_config_module_unavailable")
+        return
+    end
+    if command.action == "get_forward_config" then
+        local current, reason = module.validate_config(forward_config)
+        if not current then respond("error", reason); return end
+        respond("ok", nil, current)
+        return
+    end
+    if direct_inflight then respond("error", "direct_forward_busy"); return end
+    if sms_send_active or #send_queue > 0 then respond("error", "sms_operation_pending"); return end
+    local normalized, validation_error = module.validate_config(command.config)
+    if not normalized then respond("error", validation_error); return end
+    if not config_store_ready then respond("error", "storage_unavailable"); return end
+
+    -- 先准备候选引擎；无网络请求，旧配置在 Flash 校验成功前仍继续有效。
+    if direct_forward then direct_forward:flush() end
+    local prepared, candidate = pcall(create_direct_forwarder, normalized)
+    if not prepared or (normalized.mode == "direct" and (not candidate or not candidate:status().enabled or
+        not candidate:status().storage_available)) then
+        respond("error", "direct_forward_unavailable")
+        return
+    end
+    local previous_ok, previous = pcall(fskv.get, forwarding_config_key)
+    if not previous_ok then respond("error", "storage_unavailable"); return end
+    local written, result = pcall(fskv.set, forwarding_config_key, normalized)
+    if not written or result ~= true then respond("error", "storage_write_failed"); return end
+    local verified, readback = pcall(fskv.get, forwarding_config_key)
+    if not verified or not equal_config(readback, normalized) then
+        -- 校验失败时尽可能恢复上一份设置，不能对未确认保存的配置报告成功。
+        local rolled_back, rollback_result
+        if previous == nil then rolled_back, rollback_result = pcall(fskv.del, forwarding_config_key)
+        else rolled_back, rollback_result = pcall(fskv.set, forwarding_config_key, previous) end
+        if not rolled_back or rollback_result ~= true then forward_config_persisted = false end
+        respond("error", "storage_verify_failed")
+        return
+    end
+    forward_config, forward_mode, direct_forward = normalized, normalized.mode, candidate
+    forward_config_persisted = true
+    if forward_mode == "direct" and type(mobile.apn) == "function" then
+        -- 部分固件的 APN 仅在下次 PDP 激活后生效；保存值始终在重启时加载。
+        pcall(mobile.apn, 0, 1, forward_config.apn)
+    end
+    respond("ok", nil, forward_config)
+end
+
 function process_uart_command(cmd_data)
     if not cmd_data.action then
         send_to_uart({type = "error", msg = "missing action"})
         return
     end
 
-    if cmd_data.action == "send_sms" and
+    if cmd_data.action == "get_forward_config" or cmd_data.action == "set_forward_config" then
+        process_forward_config_command(cmd_data)
+    elseif cmd_data.action == "send_sms" and
        type(cmd_data.to) == "string" and type(cmd_data.content) == "string" then
         local item = {
             request_id = tostring(cmd_data.request_id or next_message_id()),
@@ -581,6 +672,8 @@ function process_uart_command(cmd_data)
             mem_kb = math.floor(collectgarbage("count")),
             version = VERSION,
             forward_mode = forward_mode,
+            forward_config_supported = true,
+            forward_config_persisted = forward_config_persisted,
             direct_forward = forwarding_status(),
             flymode_owner_iccid = flymode_requested and flymode_owner_iccid or "",
             flymode_source = flymode_requested and flymode_source or "",
@@ -970,17 +1063,18 @@ end)
 -- 任务循环区
 -- =================================================================================
 
-if direct_forward then
-    sys.taskInit(function()
+-- 即使开机是 uart 模式，也保留本地调度器供串口保存后立即启用 direct。
+sys.taskInit(function()
         while true do
-            direct_inflight = true
-            local ok = pcall(function() direct_forward:step() end)
-            direct_inflight = false
-            if not ok then log.error("Forward", "独立转发任务异常，将继续处理后续消息") end
+            if direct_forward then
+                direct_inflight = true
+                local ok = pcall(function() direct_forward:step() end)
+                direct_inflight = false
+                if not ok then log.error("Forward", "独立转发任务异常，将继续处理后续消息") end
+            end
             sys.wait(1000) -- 本地调度不产生网络包；空闲时不发送心跳或连通性探测。
         end
     end)
-end
 
 uart.on(uartid, "receive", function(id, len)
     local chunk = uart.read(id, len)
@@ -1006,7 +1100,7 @@ uart.on(uartid, "receive", function(id, len)
             if success and cmd then
                 process_uart_command(cmd)
             else
-                log.warn("UART", "JSON解析失败:", json_str:sub(1, 50))
+                log.warn("UART", "JSON解析失败，字节数:", #json_str)
                 send_to_uart({type="error", msg="Invalid JSON"})
             end
         end

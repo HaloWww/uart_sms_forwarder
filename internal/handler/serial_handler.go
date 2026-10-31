@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -11,6 +12,49 @@ import (
 	"github.com/labstack/echo/v5"
 	"go.uber.org/zap"
 )
+
+// GetForwardingConfig reads the selected module; no host property cache is used.
+func (h *SerialHandler) GetForwardingConfig(c *echo.Context) error {
+	c.Response().Header().Set("Cache-Control", "no-store")
+	state, err := h.serialManager.GetForwardingConfig(c.Request().Context(), strings.TrimSpace(c.QueryParam("simId")))
+	if err != nil {
+		return writeForwardingConfigError(c, err)
+	}
+	return c.JSON(http.StatusOK, state)
+}
+
+// SetForwardingConfig returns success only after device persistence and readback.
+func (h *SerialHandler) SetForwardingConfig(c *echo.Context) error {
+	c.Response().Header().Set("Cache-Control", "no-store")
+	simID, config, err := service.DecodeForwardingConfigRequest(c.Request().Body)
+	if err != nil {
+		return writeForwardingConfigError(c, err)
+	}
+	state, err := h.serialManager.SetForwardingConfig(c.Request().Context(), simID, config)
+	if err != nil {
+		return writeForwardingConfigError(c, err)
+	}
+	return c.JSON(http.StatusOK, state)
+}
+
+func writeForwardingConfigError(c *echo.Context, err error) error {
+	status, code, message := http.StatusServiceUnavailable, "forwarding_config_failed", "无法读取或保存板子的转发设置"
+	switch {
+	case errors.Is(err, service.ErrForwardingConfigInvalid):
+		status, code, message = http.StatusBadRequest, "forwarding_config_invalid", err.Error()
+	case errors.Is(err, service.ErrForwardingConfigNotPersisted):
+		status, code, message = http.StatusConflict, "forwarding_not_persisted", "板子未确认持久保存，请重新读取设备确认设置，检查存储后重试"
+	case errors.Is(err, service.ErrSIMProtocolOutdated):
+		status, code, message = http.StatusConflict, "lua_script_outdated", "此功能需要 main.lua 1.6.0 或更高版本，请先更新设备脚本"
+	case errors.Is(err, service.ErrControlCommandTimeout):
+		status, code, message = http.StatusGatewayTimeout, "forwarding_timeout", "等待板子确认超时；配置可能已写入，请重新读取设备确认，不要反复保存"
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		status, code, message = http.StatusRequestTimeout, "forwarding_request_interrupted", "请求中断，配置结果未确认，请重新读取设备确认"
+	default:
+		return writeServiceError(c, err, status, code, message)
+	}
+	return c.JSON(status, map[string]string{"code": code, "error": message})
+}
 
 // SerialHandler 串口控制API处理器
 type SerialHandler struct {

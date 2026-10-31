@@ -89,6 +89,43 @@ export interface DirectForwardStats {
     last_error: string;
 }
 
+export type ForwardingChannelType = 'bark' | 'wecom_app' | 'webhook';
+
+export interface ForwardingChannel {
+    id: string;
+    type: ForwardingChannelType;
+    enabled: boolean;
+    server?: string;
+    key?: string;
+    title?: string;
+    group?: string;
+    corp_id?: string;
+    agent_id?: number;
+    secret?: string;
+    to_user?: string;
+    url?: string;
+    ca_cert?: string;
+}
+
+export interface ForwardingConfig {
+    mode: 'uart' | 'direct';
+    apn: string;
+    queue_limit: number;
+    max_attempts: number;
+    retry_base_seconds: number;
+    retry_max_seconds: number;
+    min_interval_seconds: number;
+    stats_save_seconds: number;
+    timezone_offset_seconds: number;
+    template: string;
+    channels: ForwardingChannel[];
+}
+
+export interface ForwardingConfigResponse {
+    config: ForwardingConfig;
+    persisted: boolean;
+}
+
 // 设备状态响应（来自 Lua 脚本的 status_response）
 export interface DeviceStatus {
     device_id: string;
@@ -105,6 +142,8 @@ export interface DeviceStatus {
     connected: boolean;          // 串口连接状态
     version: string;             // Lua 版本
     forward_mode?: 'uart' | 'direct';
+    forward_config_supported?: boolean;
+    forward_config_persisted?: boolean;
     direct_forward?: DirectForwardStats;
 }
 

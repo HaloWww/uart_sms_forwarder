@@ -47,9 +47,10 @@ var (
 )
 
 type controlCommandResponse struct {
-	Action string
-	Result string
-	Error  string
+	Action  string
+	Result  string
+	Error   string
+	Payload map[string]interface{}
 }
 
 type ScheduledTaskStatusUpdater func(ctx context.Context, msgID string, status models.LastRunStatus) error
@@ -537,10 +538,10 @@ func (s *SerialService) processReceivedData(data string) {
 			return
 		}
 		if errors.Is(err, errMissingType) {
-			s.logger.Warn("消息类型缺失", zap.String("data", data))
+			s.logger.Warn("消息类型缺失", zap.Int("payload_bytes", len(data)))
 			return
 		}
-		s.logger.Error("解析串口消息失败", zap.Error(err), zap.String("data", data))
+		s.logger.Error("解析串口消息失败", zap.Error(err), zap.Int("payload_bytes", len(data)))
 		return
 	}
 

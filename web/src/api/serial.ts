@@ -1,5 +1,5 @@
 import apiClient from './client';
-import type {DeviceStatus, SendSMSRequest, SendSMSResponse, SimStatus} from './types';
+import type {DeviceStatus, ForwardingConfig, ForwardingConfigResponse, SendSMSRequest, SendSMSResponse, SimStatus} from './types';
 
 // 发送短信
 export const sendSMS = (data: SendSMSRequest) => {
@@ -26,4 +26,11 @@ export const setFlymode = (enabled: boolean, simId: string) => {
 export const rebootMcu = (simId: string) => {
   return apiClient.post('/serial/reboot', {simId});
 };
+
+// Settings are read from and acknowledged by the physical board, not the host database.
+export const getForwardingConfig = (simId: string) =>
+  apiClient.get<ForwardingConfigResponse>('/serial/forwarding', {params: {simId}});
+
+export const saveForwardingConfig = (simId: string, config: ForwardingConfig) =>
+  apiClient.put<ForwardingConfigResponse>('/serial/forwarding', {simId, config});
 

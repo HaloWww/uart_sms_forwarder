@@ -24,6 +24,8 @@ type StatusData struct {
 	Type                    string             `json:"type"`    // 消息类型
 	Version                 string             `json:"version"` // Lua 脚本版本
 	ForwardMode             string             `json:"forward_mode"`
+	ForwardConfigSupported  bool               `json:"forward_config_supported"`
+	ForwardConfigPersisted  bool               `json:"forward_config_persisted"`
 	DirectForward           DirectForwardStats `json:"direct_forward"`
 	Mobile                  struct {
 		IsRegistered bool    `json:"is_registered"`
@@ -217,7 +219,7 @@ func (s *SerialService) handleCommandResponse(msg *ParsedMessage) {
 		if value, ok := s.pendingControls.Load(requestID); ok {
 			if responseCh, ok := value.(chan controlCommandResponse); ok {
 				select {
-				case responseCh <- controlCommandResponse{Action: action, Result: result, Error: responseError}:
+				case responseCh <- controlCommandResponse{Action: action, Result: result, Error: responseError, Payload: msg.Payload}:
 				default:
 				}
 			}

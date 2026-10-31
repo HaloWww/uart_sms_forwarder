@@ -517,8 +517,12 @@ end
 -- Load the real entry point in an isolated Lua environment. Tasks are resumed
 -- cooperatively only to establish the SIM snapshot; no real modem or network
 -- library is loaded and no code substitutions are made in main.lua.
-local function load_main(configuration, config_error)
-    local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {}}
+local function load_main(configuration, config_error, options)
+    options = options or {}
+    local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {},
+        storage = options.storage or {}, http_calls = {}, time = 100, tx = 0, rx = 0,
+        fail_set = options.fail_set, storage_broken = options.storage_broken,
+        readback_mismatch = options.readback_mismatch, current_iccid = message().iccid}
     local sandbox = setmetatable({}, {__index = _G})
     local noop = function() end
     local sys = {
@@ -550,6 +554,37 @@ local function load_main(configuration, config_error)
     sandbox.mcu = {ticks2 = function() return 100 end}
     sandbox.cc = {lastNum = function() return "10010" end}
     sandbox.pm = {reboot = noop}
+    sandbox.fskv = {
+        init = function() return not env.storage_broken end,
+        get = function(key)
+            if env.readback_mismatch and key == "direct_config_v1" and env.last_set == key then
+                return {mode = "uart", channels = {}}
+            end
+            return copy(env.storage[key])
+        end,
+        set = function(key, value)
+            if env.storage_broken or env.fail_set == key then return false end
+            env.storage[key], env.last_set = copy(value), key
+            return true
+        end,
+        del = function(key) env.storage[key] = nil; return true end,
+    }
+    sandbox.socket = {LWIP_GP = 4, adapter = function(adapter) return adapter == 4 end}
+    sandbox.http = {request = function(method, url, headers, body, request_options)
+        env.http_calls[#env.http_calls + 1] = {method = method, url = url, headers = copy(headers), body = body, options = copy(request_options)}
+        env.tx, env.rx = env.tx + 100, env.rx + 200
+        return {wait = function() return 200, {}, json.encode({code = 200, errcode = 0}) end}
+    end}
+    sandbox.mobile.iccid = function() return env.current_iccid end
+    sandbox.mobile.dataTraffic = function() return 0, env.tx, 0, env.rx end
+    sandbox.mcu.ticks2 = function() return env.time end
+    local direct_module
+    local function actual_direct_module()
+        if not direct_module then
+            direct_module = assert(loadfile("direct_forward.lua", "t", sandbox))()
+        end
+        return direct_module
+    end
     sandbox.require = function(name)
         env.imports[name] = true
         if name == "sys" then return sys end
@@ -558,7 +593,9 @@ local function load_main(configuration, config_error)
             return configuration
         end
         if name == "direct_forward" then
-            return {new = function(_, deps)
+            if options.use_real_direct then return actual_direct_module() end
+            return {validate_config = function(value) return actual_direct_module().validate_config(value) end,
+                new = function(_, deps)
                 env.direct_deps = deps
                 return {
                     enqueue = function(_, msg) env.forwarded[#env.forwarded + 1] = copy(msg); return true end,
@@ -576,8 +613,10 @@ local function load_main(configuration, config_error)
     function env:resume_tasks(rounds)
         for _ = 1, rounds or 1 do
             for _, task in ipairs(self.tasks) do
-                local ok, task_error = coroutine.resume(task)
-                assert(ok, task_error)
+                if coroutine.status(task) ~= "dead" then
+                    local ok, task_error = coroutine.resume(task)
+                    assert(ok, task_error)
+                end
             end
         end
     end
@@ -591,6 +630,22 @@ local function load_main(configuration, config_error)
             local data = body and json.decode(body)
             if data and data.type == kind then return data end
         end
+    end
+    function env:last_response(request_id)
+        for index = #self.frames, 1, -1 do
+            local body = self.frames[index]:match("^SMS_START:(.*):SMS_END\r\n$")
+            local data = body and json.decode(body)
+            if data and data.type == "cmd_response" and data.request_id == request_id then return data end
+        end
+    end
+    function env:command(action, value, expected_iccid)
+        local request_id = action .. "-" .. tostring(#self.frames + 1)
+        self.sandbox.process_uart_command({action = action, request_id = request_id,
+            expected_iccid = expected_iccid or message().iccid, config = value})
+        self:flush_uart()
+        local reply = self:last_response(request_id)
+        assert(reply, "missing response for " .. action)
+        return reply
     end
     return env
 end
@@ -656,6 +711,163 @@ function tests.main_direct_rejects_auto_flight_enable_but_allows_disable()
     equal(#env.fly_calls, 1)
     equal(env.fly_calls[1].enabled, false)
     equal(env:last_frame("cmd_response").result, "ok")
+end
+
+function tests.main_saved_direct_mode_works_without_host_and_survives_power_cycle()
+    local env = load_main({mode = "uart", channels = {}}, nil, {use_real_direct = true})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    local initial = env:command("get_forward_config")
+    equal(initial.result, "ok")
+    equal(initial.persisted, false)
+    equal(initial.config.mode, "uart")
+
+    local saved = env:command("set_forward_config", config())
+    equal(saved.result, "ok")
+    equal(saved.persisted, true)
+    equal(env.storage.direct_config_v1.mode, "direct")
+    equal(env.storage.direct_config_v1.channels[1].key, default_channel.key)
+    local readback = env:command("get_forward_config")
+    equal(readback.config.mode, "direct")
+    equal(readback.persisted, true)
+
+    -- No get_status/host discovery after saving: the modem worker must run by
+    -- itself, including when the boot mode was uart.
+    env.events.SMS_INC("10086", "forward with the exe closed")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 1)
+    equal(env.http_calls[1].options.adapter, env.sandbox.socket.LWIP_GP)
+
+    -- A new entry-point instance gets only durable Flash, not the old process
+    -- state or a remembered Windows configuration.
+    local rebooted = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, storage = env.storage})
+    assert(rebooted.loaded, rebooted.load_error)
+    rebooted:resume_tasks(3)
+    rebooted.events.SMS_INC("10010", "forward after power cycle")
+    rebooted:resume_tasks(3)
+    equal(#rebooted.http_calls, 1)
+    local restored = rebooted:command("get_forward_config")
+    equal(restored.persisted, true)
+    equal(restored.config.mode, "direct")
+end
+
+function tests.main_saved_uart_mode_disables_standalone_forwarding_after_reboot()
+    local env = load_main(config(), nil, {use_real_direct = true})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    local saved = env:command("set_forward_config", {mode = "uart", channels = {}})
+    equal(saved.result, "ok")
+    equal(saved.persisted, true)
+    env.events.SMS_INC("10086", "host only")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+
+    local rebooted = load_main(config(), nil, {use_real_direct = true, storage = env.storage})
+    assert(rebooted.loaded, rebooted.load_error)
+    rebooted:resume_tasks(3)
+    rebooted.events.SMS_INC("10086", "still host only")
+    rebooted:resume_tasks(3)
+    equal(#rebooted.http_calls, 0)
+    equal(rebooted:command("get_forward_config").config.mode, "uart")
+end
+
+function tests.main_configuration_save_failure_is_not_acknowledged_or_activated()
+    local env = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, fail_set = "direct_config_v1"})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    local failed = env:command("set_forward_config", config())
+    equal(failed.result, "error")
+    assert(failed.persisted ~= true)
+    equal(env.storage.direct_config_v1, nil)
+    equal(env:command("get_forward_config").config.mode, "uart")
+    env.events.SMS_INC("10086", "must remain host forwarded")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+end
+
+function tests.main_configuration_requires_flash_before_success()
+    local env = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, storage_broken = true})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    local failed = env:command("set_forward_config", config())
+    equal(failed.result, "error")
+    equal(env.storage.direct_config_v1, nil)
+    equal(env:command("get_forward_config").config.mode, "uart")
+end
+
+function tests.main_configuration_rejects_wrong_sim_and_missing_correlation()
+    local env = load_main({mode = "uart", channels = {}}, nil, {use_real_direct = true})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    equal(env:command("set_forward_config", config(), "different-sim").result, "error")
+    equal(env:command("get_forward_config", nil, "different-sim").result, "error")
+    equal(env.storage.direct_config_v1, nil)
+    env.sandbox.process_uart_command({action = "set_forward_config", expected_iccid = message().iccid, config = config()})
+    env:flush_uart()
+    equal(env.storage.direct_config_v1, nil)
+    equal(env:command("get_forward_config").config.mode, "uart")
+end
+
+function tests.main_configuration_rejects_invalid_or_oversize_settings_without_secret_echo()
+    local env = load_main({mode = "uart", channels = {}}, nil, {use_real_direct = true})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    local invalid = config()
+    invalid.channels[1].server = "http://unsafe.invalid/secret-url"
+    local rejected = env:command("set_forward_config", invalid)
+    equal(rejected.result, "error")
+    assert(not json.encode(rejected):find("secret-url", 1, true))
+    assert(not json.encode(rejected):find(default_channel.key, 1, true))
+    local oversized = config()
+    oversized.template = string.rep("x", 5000)
+    equal(env:command("set_forward_config", oversized).result, "error")
+    local oversized_certificate = config()
+    oversized_certificate.channels[1].ca_cert = string.rep("A", 4000)
+    equal(env:command("set_forward_config", oversized_certificate).result, "error")
+    local protocol_marker = config()
+    protocol_marker.template = "{{content}}:CMD_END"
+    equal(env:command("set_forward_config", protocol_marker).result, "error")
+    equal(env.storage.direct_config_v1, nil)
+end
+
+function tests.main_configuration_readback_mismatch_does_not_activate_direct()
+    local env = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, readback_mismatch = true})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    equal(env:command("set_forward_config", config()).result, "error")
+    equal(env:command("get_forward_config").config.mode, "uart")
+    env.events.SMS_INC("10086", "not activated without readback")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
+    -- Rollback must prevent a later reboot from activating a failed save.
+    equal(env.storage.direct_config_v1, nil)
+end
+
+function tests.main_generic_status_does_not_expose_saved_channel_keys()
+    local env = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, storage = {direct_config_v1 = config()}})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    env.sandbox.process_uart_command({action = "get_status"})
+    env:flush_uart()
+    local status = env:last_frame("status_response")
+    equal(status.forward_mode, "direct")
+    equal(status.forward_config_persisted, true)
+    assert(not json.encode(status):find(default_channel.key, 1, true))
+end
+
+function tests.main_invalid_saved_config_does_not_silently_revert_to_uart()
+    local invalid = config()
+    invalid.mode = "unexpected-mode"
+    local env = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, storage = {direct_config_v1 = invalid}})
+    equal(env.loaded, false)
+    assert(not tostring(env.load_error):find(default_channel.key, 1, true))
+    equal(#env.http_calls, 0)
 end
 
 local names = {}

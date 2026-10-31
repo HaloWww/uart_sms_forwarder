@@ -34,6 +34,85 @@ local function route_key(channel)
     return tostring(hash)
 end
 
+-- 独立校验/规范化用于串口配置与启动恢复；不会发起 HTTP 或修改 Flash。
+function M.validate_config(value)
+    if type(value) ~= "table" or (value.mode ~= "uart" and value.mode ~= "direct") then
+        return nil, "invalid_forward_mode"
+    end
+    local normalized = {mode = value.mode, channels = {}}
+    local ranges = {
+        queue_limit = {8, 1, 8}, max_attempts = {3, 1, 10},
+        retry_base_seconds = {30, 5, 3600}, retry_max_seconds = {900, 5, 86400},
+        min_interval_seconds = {2, 1, 3600}, stats_save_seconds = {60, 10, 3600},
+        timezone_offset_seconds = {28800, -43200, 50400},
+    }
+    for key, range in pairs(ranges) do
+        local number = value[key]
+        if number == nil then number = range[1] end
+        if type(number) ~= "number" or number ~= number or number < range[2] or
+            number > range[3] or number ~= math.floor(number) then return nil, "invalid_" .. key end
+        normalized[key] = math.floor(number)
+    end
+    if normalized.retry_max_seconds < normalized.retry_base_seconds then return nil, "invalid_retry_range" end
+    normalized.apn = value.apn or ""
+    normalized.template = value.template or "{{content}}\n接收号码：{{receiver}}\n时间：{{time}}"
+    if type(normalized.apn) ~= "string" or #normalized.apn > 100 or normalized.apn:find("[\r\n%z]") then
+        return nil, "invalid_apn"
+    end
+    if type(normalized.template) ~= "string" or normalized.template:match("^%s*$") or #normalized.template > 1024 then
+        return nil, "invalid_template"
+    end
+    if value.channels ~= nil and type(value.channels) ~= "table" then return nil, "invalid_channels" end
+    local ids, count, enabled = {}, 0, 0
+    for index, channel in pairs(value.channels or {}) do
+        if type(index) ~= "number" or index < 1 or index ~= math.floor(index) or index > 3 or
+            type(channel) ~= "table" then return nil, "invalid_channels" end
+        count = count + 1
+    end
+    if count ~= #(value.channels or {}) then return nil, "invalid_channels" end
+    for index, channel in ipairs(value.channels or {}) do
+        if type(channel.id) ~= "string" or #channel.id == 0 or #channel.id > 40 or
+            not channel.id:match("^[A-Za-z0-9_-]+$") or ids[channel.id] then return nil, "invalid_channel_id" end
+        if channel.type ~= "bark" and channel.type ~= "wecom_app" and channel.type ~= "webhook" then
+            return nil, "invalid_channel_type"
+        end
+        if channel.enabled ~= nil and type(channel.enabled) ~= "boolean" then return nil, "invalid_channel_enabled" end
+        local item = {id = channel.id, type = channel.type, enabled = channel.enabled == true}
+        ids[item.id] = true
+        for _, key in ipairs({"server", "key", "title", "group", "corp_id", "secret", "to_user", "url", "ca_cert"}) do
+            if channel[key] ~= nil then
+                if type(channel[key]) ~= "string" or channel[key]:find("%z") then return nil, "invalid_channel_field" end
+                item[key] = channel[key]
+            end
+        end
+        if channel.agent_id ~= nil then
+            if type(channel.agent_id) ~= "number" or channel.agent_id ~= channel.agent_id or
+                channel.agent_id < 0 or channel.agent_id > 2147483647 or
+                channel.agent_id ~= math.floor(channel.agent_id) then return nil, "invalid_agent_id" end
+            item.agent_id = math.floor(channel.agent_id)
+        end
+        if item.enabled then
+            enabled = enabled + 1
+            local endpoint = item.type == "bark" and (item.server or "https://api.day.app") or item.url
+            if item.type ~= "wecom_app" and (not https(endpoint) or endpoint:find("@", 1, true) or endpoint:find("#", 1, true)) then
+                return nil, "invalid_channel_https_url"
+            end
+            if item.type == "bark" and not nonempty(item.key) then return nil, "bark_key_required" end
+            if item.type == "wecom_app" and (not nonempty(item.corp_id) or not nonempty(item.secret) or
+                not nonempty(item.to_user) or not item.agent_id or item.agent_id < 1) then return nil, "wecom_config_required" end
+        end
+        normalized.channels[index] = item
+    end
+    if value.mode == "direct" and enabled == 0 then return nil, "no_enabled_channels" end
+    local ok, encoded = pcall(json.encode, normalized)
+    if not ok or type(encoded) ~= "string" then return nil, "config_encoding_failed" end
+    if #encoded > 3800 then return nil, "config_too_large" end
+    if encoded:find(":CMD_END", 1, true) or encoded:find(":SMS_END", 1, true) then
+        return nil, "config_contains_protocol_marker"
+    end
+    return normalized
+end
+
 function M.new(config, deps)
     config, deps = config or {}, deps or {}
     local self = {queue = {}, channels = {}, tokens = {}, config = config}

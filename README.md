@@ -95,7 +95,22 @@ devices:
 
 默认的 `uart` 模式保留现有行为：Air780 通过 USB 将短信交给 Ubuntu/Windows 服务，由上位机执行通知渠道配置。`direct` 模式则由 Air780 使用 SIM 卡自己的蜂窝数据连接发送通知，无需运行上位机。SIM 卡必须已开通短信和数据流量业务；建议先使用第一卡槽（SIM0）验证。
 
-下载 Release 中的 `uart_sms_forwarder-lua.zip` 即可获得独立运行所需的脚本，无需下载 Ubuntu/Windows 程序。用 LuaTools 同时烧录其中的 `main.lua`（1.5.0+）、`direct_forward.lua`、`forward_config.lua`，并添加默认 lib。为模组选择支持 `http`、`mobile`、`fskv` 的 LuatOS 固件；不能使用 AT 固件。编辑 `forward_config.lua` 即可选择模式和通知渠道，例如：
+下载 Release 中的 `uart_sms_forwarder-lua.zip` 即可获得独立运行所需的脚本。用 LuaTools 同时烧录其中的 `main.lua`（1.6.0+）、`direct_forward.lua`、`forward_config.lua`，并添加默认 lib。为模组选择支持 `http`、`mobile`、`fskv` 的 LuatOS 固件；不能使用 AT 固件。1.5.x 脚本仅支持修改文件后烧录，若要通过 exe 配置并保存到板子，需要先升级一次这三个设备脚本。
+
+### 从 Windows / Ubuntu 配置并保存到板子
+
+1. 启动新版 exe 或 Ubuntu 服务，连接并选中目标 SIM，等待身份确认。
+2. 打开“串口控制”页面的“板载独立转发”，选择“SIM 流量独立转发”，填写并启用 Bark、企业微信应用或 Webhook 渠道，可同时设置模板和 APN。
+3. 点击“保存到板子”，等待设备持久保存并回读确认成功。只有收到设备确认后才显示保存成功；超时或报错时应重新读取设备配置，不能把电脑里修改过的表单视为已保存。
+4. 关闭 exe / Ubuntu 服务，保持板子供电，用另一部手机发送测试短信。板子会自行联网并转发；断电后重新供电也会读取相同设置。
+
+设置保存在当前物理板子的 Flash 中，不依赖 exe、浏览器或电脑数据库。多台板子需要分别选中并保存；把 SIM 移到另一块板子不会自动迁移通知设置。日后修改渠道或切换回“主机转发”都可在页面保存，无需再次烧录。退出程序不会关闭板载独立转发；要关闭时，应连接设备并保存“主机转发”模式。
+
+板载配置最多包含三个渠道，编码后的配置总长不能超过 3800 字节；CA 证书和模板也计入该长度。Flash 不可用、写入失败、配置超限或 SIM 身份不匹配时会拒绝保存，不会只留在电脑上却提示“保存到板子成功”。渠道密钥仅在明确读取板载配置的认证接口中返回，不会附在日常状态轮询中。
+
+模式和渠道保存后会立即应用。APN 在部分固件中要等下次移动数据连接激活才生效；如修改 APN 后仍未联网，可重启板子，让它在联网前加载已保存的 APN。
+
+`forward_config.lua` 仍可填写出厂/脚本默认值，尚未保存板载配置时会使用它；已持久保存的板载配置优先于脚本默认值。例如，预配置独立模式的脚本可写为：
 
 ```lua
 return {
@@ -137,7 +152,7 @@ return {
 }
 ```
 
-渠道的 `id` 应保持唯一且稳定，用于记录每条消息在该渠道的发送结果。当前独立模式支持 Bark、企业微信应用和 JSON Webhook，并转发短信与来电通知；上位机的其他渠道仍仅在 `uart` 模式使用。独立模式的设置保存在脚本内，Ubuntu 网页中的渠道和全局包装配置不会同步到模块，修改后需要重新烧录配置脚本并重启。密钥会保存在设备脚本中，不要把填写真实密钥的文件提交到公开仓库。
+渠道的 `id` 应保持唯一且稳定，用于记录每条消息在该渠道的发送结果。当前独立模式支持 Bark、企业微信应用和 JSON Webhook，并转发短信与来电通知；上位机的其他渠道仍仅在 `uart` 模式使用。“通知渠道”页面中的主机渠道和全局包装配置，与“板载独立转发”分别保存，不会暗中互相覆盖。密钥会保存在设备脚本或板子 Flash 中，不要把填写真实密钥的文件提交到公开仓库；普通设备状态和日志不会返回板载渠道密钥。
 
 独立模板支持 `{{content}}`、`{{from}}`、`{{receiver}}`/`{{to}}`、`{{iccid}}`、`{{imei}}`、`{{imsi}}`、`{{time}}`（按 `timezone_offset_seconds` 格式化）和 `{{timestamp}}`（Unix 秒）。卡内没有保存手机号时，`receiver`/`to` 可能为空。JSON Webhook 还会携带 `message_id`，并设置同值的 `Idempotency-Key` 请求头，服务端可据此去重；返回 HTTP 2xx 表示成功，推荐无正文的 `204` 响应以减少流量。企业微信应用的可信 IP 限制仍适用，SIM 的公网出口 IP 可能变化，直连失败时需先检查企业微信返回的配置错误。
 
@@ -183,6 +198,8 @@ CMD_START:{"action":"get_forward_stats"}:CMD_END
 - `POST /api/serial/sms`：请求体必须携带 `simId` 和 UUID 形式的 `requestId`（也可用 `Idempotency-Key` 请求头）。重试同一请求必须复用同一 ID；同 ID 且 `simId`/`to`/`content` 相同时只返回原 `messageId`、不会再次发送，参数不同则返回 409
 - `POST /api/serial/flymode`：请求体必须携带 `simId`，运行时解析当前承载模块
 - `POST /api/serial/reboot`：可按 `simId` 重启当前承载模块，也保留 `deviceId` 物理控制方式
+- `GET /api/serial/forwarding?simId=iccid:...`：读取当前承载板子的转发模式、渠道、模板及持久保存状态，需要 `main.lua` 1.6.0+
+- `PUT /api/serial/forwarding`：请求体 `{simId, config}`，通过串口写入板子并等待持久保存和回读确认，不仅保存到电脑
 - `POST /api/scheduled-tasks/:id/trigger`：请求体必须携带 UUID 形式的 `requestId`（也可用 `Idempotency-Key` 请求头）；浏览器响应丢失时必须复用原 ID，避免“立即执行”被重复下发
 
 ## 截图

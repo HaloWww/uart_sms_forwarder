@@ -289,6 +289,8 @@ func setupApi(app *orz.App, handlers *Handlers, appConfig *config.AppConfig, log
 	api.GET("/serial/sims", handlers.Serial.GetSIMs)
 	api.POST("/serial/flymode", handlers.Serial.SetFlymode)
 	api.POST("/serial/reboot", handlers.Serial.RebootMcu)
+	api.GET("/serial/forwarding", handlers.Serial.GetForwardingConfig)
+	api.PUT("/serial/forwarding", handlers.Serial.SetForwardingConfig)
 
 	// ScheduledTask API (RESTful)
 	api.GET("/scheduled-tasks", handlers.ScheduledTask.List)
