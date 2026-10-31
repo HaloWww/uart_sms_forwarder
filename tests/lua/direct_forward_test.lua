@@ -521,7 +521,7 @@ local function load_main(configuration, config_error, options)
     options = options or {}
     local env = {events = {}, tasks = {}, frames = {}, forwarded = {}, imports = {}, fly_calls = {},
         storage = options.storage or {}, http_calls = {}, time = 100, tx = 0, rx = 0,
-        fail_set = options.fail_set, storage_broken = options.storage_broken,
+        fail_set = options.fail_set, fail_get = options.fail_get, storage_broken = options.storage_broken,
         readback_mismatch = options.readback_mismatch, current_iccid = message().iccid}
     local sandbox = setmetatable({}, {__index = _G})
     local noop = function() end
@@ -557,6 +557,7 @@ local function load_main(configuration, config_error, options)
     sandbox.fskv = {
         init = function() return not env.storage_broken end,
         get = function(key)
+            if env.fail_get == key then error("simulated Flash read failure") end
             if env.readback_mismatch and key == "direct_config_v1" and env.last_set == key then
                 return {mode = "uart", channels = {}}
             end
@@ -796,6 +797,19 @@ function tests.main_configuration_requires_flash_before_success()
     equal(failed.result, "error")
     equal(env.storage.direct_config_v1, nil)
     equal(env:command("get_forward_config").config.mode, "uart")
+end
+
+function tests.main_configuration_queue_restore_error_does_not_activate_candidate()
+    local env = load_main({mode = "uart", channels = {}}, nil,
+        {use_real_direct = true, fail_get = "direct_queue_v1_1"})
+    assert(env.loaded, env.load_error)
+    env:resume_tasks(3)
+    equal(env:command("set_forward_config", config()).result, "error")
+    equal(env.storage.direct_config_v1, nil)
+    equal(env:command("get_forward_config").config.mode, "uart")
+    env.events.SMS_INC("10086", "stay on the previous mode after restore failure")
+    env:resume_tasks(3)
+    equal(#env.http_calls, 0)
 end
 
 function tests.main_configuration_rejects_wrong_sim_and_missing_correlation()

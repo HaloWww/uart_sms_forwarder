@@ -178,6 +178,10 @@ function M.new(config, deps)
         stats.storage_available = store_ready
         if store_ready then
             local read_ok, saved = pcall(store.get, STATS_KEY)
+            if not read_ok then
+                stats.storage_available = false
+                error_status("storage_read_failed")
+            end
             if read_ok and type(saved) == "table" then
                 for _, key in ipairs({"sent", "failed", "dropped", "requests", "unmetered_requests", "tx_bytes", "rx_bytes"}) do
                     stats[key] = math.max(0, tonumber(saved[key]) or 0)
@@ -186,6 +190,10 @@ function M.new(config, deps)
             end
             for slot = 1, SLOT_COUNT do
                 local read_ok, item = pcall(store.get, slot_key(slot))
+                if not read_ok then
+                    stats.storage_available = false
+                    error_status("storage_read_failed")
+                end
                 if read_ok and type(item) == "table" and type(item.message) == "table" and
                     type(item.targets) == "table" then
                     item.slot = slot
