@@ -24,9 +24,9 @@ try {
         Push-Location "web"
         try {
             npm ci
-            if ($LASTEXITCODE -ne 0) { throw "安装前端依赖失败: $LASTEXITCODE" }
+            if ($LASTEXITCODE -ne 0) { throw "Frontend dependency installation failed: $LASTEXITCODE" }
             npm run build
-            if ($LASTEXITCODE -ne 0) { throw "构建前端失败: $LASTEXITCODE" }
+            if ($LASTEXITCODE -ne 0) { throw "Frontend build failed: $LASTEXITCODE" }
         }
         finally {
             Pop-Location
@@ -46,7 +46,7 @@ try {
         $env:GOARCH = $Architecture
         $ldflags = "-s -w -X github.com/dushixiang/uart_sms_forwarder/internal/version.Version=$Version"
         go build "-ldflags=$ldflags" -o (Join-Path $packageDirectory "uart_sms_forwarder.exe") ./cmd/serv
-        if ($LASTEXITCODE -ne 0) { throw "构建 Windows 程序失败: $LASTEXITCODE" }
+        if ($LASTEXITCODE -ne 0) { throw "Windows build failed: $LASTEXITCODE" }
     }
     finally {
         $env:CGO_ENABLED = $previousCgo

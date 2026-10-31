@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/dushixiang/uart_sms_forwarder/internal"
+	"github.com/go-orz/orz"
 	_ "github.com/go-orz/orz/drivers/sqlite"
 )
 
@@ -47,6 +49,10 @@ func main() {
 		fmt.Printf("systemd 服务已安装并启动: %s\n", systemdServiceName)
 		fmt.Printf("查看状态: systemctl status %s\n", systemdServiceName)
 		return
+	}
+	if err := prepareRuntimeDirectories(configPath); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 	internal.Run(configPath)
 }
@@ -107,10 +113,8 @@ func installSystemdService(configPath string) error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("此命令仅支持 Linux，当前系统为 %s", runtime.GOOS)
 	}
-	for _, directory := range []string{"data", "logs"} {
-		if err := os.MkdirAll(filepath.Join(filepath.Dir(configPath), directory), 0o750); err != nil {
-			return fmt.Errorf("创建运行目录 %s 失败: %w", directory, err)
-		}
+	if err := prepareRuntimeDirectories(configPath); err != nil {
+		return err
 	}
 	executablePath, err := os.Executable()
 	if err != nil {
@@ -142,6 +146,89 @@ func installSystemdService(configPath string) error {
 		}
 	}
 	return nil
+}
+
+// prepareRuntimeDirectories uses the framework's own loader so configured
+// paths, defaults and environment overrides match the subsequent database open.
+// Directory preparation is part of the binary startup, not just start.ps1.
+func prepareRuntimeDirectories(configPath string) error {
+	absoluteConfigPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return fmt.Errorf("resolve config path: %w", err)
+	}
+	manager := orz.NewConfigManager()
+	if err := manager.LoadFromFile(absoluteConfigPath); err != nil {
+		return fmt.Errorf("load runtime directory configuration: %w", err)
+	}
+	config := manager.GetConfig()
+	if config == nil {
+		return fmt.Errorf("cannot decode runtime directory configuration")
+	}
+	baseDirectory := filepath.Dir(absoluteConfigPath)
+	createParent := func(filename, description string) error {
+		if filename == "" {
+			return nil
+		}
+		if !filepath.IsAbs(filename) {
+			filename = filepath.Join(baseDirectory, filename)
+		}
+		directory := filepath.Dir(filename)
+		if err := os.MkdirAll(directory, 0o750); err != nil {
+			return fmt.Errorf("cannot create %s directory %q; check the path and write permissions: %w", description, directory, err)
+		}
+		return nil
+	}
+	if config.Database.Enabled && config.Database.Type == orz.DatabaseSqlite {
+		dsn := config.Database.URL
+		if dsn == "" {
+			dsn = config.Database.Sqlite.Path
+		}
+		filename, err := sqliteDatabaseFilename(dsn)
+		if err != nil {
+			return fmt.Errorf("invalid SQLite database path: %w", err)
+		}
+		if err := createParent(filename, "SQLite database"); err != nil {
+			return err
+		}
+	}
+	return createParent(config.Log.Filename, "log")
+}
+
+// SQLite URI parameters are not filesystem path characters. Memory databases
+// and read-only connections must not create directories at startup.
+func sqliteDatabaseFilename(dsn string) (string, error) {
+	if dsn == "" || strings.HasPrefix(dsn, ":memory:") {
+		return "", nil
+	}
+	if !strings.HasPrefix(dsn, "file:") {
+		filename, _, _ := strings.Cut(dsn, "?")
+		return filename, nil
+	}
+	uri, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
+	}
+	mode := uri.Query().Get("mode")
+	if mode == "memory" || mode == "ro" {
+		return "", nil
+	}
+	filename := uri.Path
+	if uri.Opaque != "" {
+		filename, err = url.PathUnescape(uri.Opaque)
+		if err != nil {
+			return "", err
+		}
+	}
+	if filename == ":memory:" {
+		return "", nil
+	}
+	if uri.Host != "" && uri.Host != "localhost" {
+		return "", fmt.Errorf("unsupported SQLite file URI host %q", uri.Host)
+	}
+	if runtime.GOOS == "windows" && len(filename) >= 3 && filename[0] == '/' && filename[2] == ':' {
+		filename = filename[1:]
+	}
+	return filepath.FromSlash(filename), nil
 }
 
 func buildSystemdUnit(executablePath, configPath string) (string, error) {

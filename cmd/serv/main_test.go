@@ -1,13 +1,123 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
+
+func TestPrepareRuntimeDirectoriesCreatesSQLiteAndLogParents(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "config.yaml")
+	configuration := "database:\n  enabled: true\n  type: sqlite\n  sqlite:\n    path: ./data/app.db\nlog:\n  filename: ./logs/app.log\n"
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareRuntimeDirectories(configPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"data", "logs"} {
+		info, err := os.Stat(filepath.Join(directory, name))
+		if err != nil || !info.IsDir() {
+			t.Fatalf("missing runtime directory %s: %v", name, err)
+		}
+	}
+	// Exercise the reported SQLite failure, rather than only checking mkdir.
+	databasePath := filepath.Join(directory, "data", "app.db")
+	db, err := gorm.Open(sqlite.Open(databasePath), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("SQLite still cannot open after preparation: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec("CREATE TABLE startup_marker (value TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec("INSERT INTO startup_marker VALUES ('preserve')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareRuntimeDirectories(configPath); err != nil {
+		t.Fatal(err)
+	}
+	var value string
+	if err := sqlDB.QueryRow("SELECT value FROM startup_marker").Scan(&value); err != nil || value != "preserve" {
+		t.Fatalf("repeat preparation changed existing database: value=%q err=%v", value, err)
+	}
+}
+
+func TestPrepareRuntimeDirectoriesHonorsCustomPathsAndURLPrecedence(t *testing.T) {
+	directory := t.TempDir()
+	absoluteLog := filepath.Join(t.TempDir(), "nested", "app.log")
+	configPath := filepath.Join(directory, "config.yaml")
+	configuration := fmt.Sprintf("database:\n  enabled: true\n  type: sqlite\n  url: file:custom%%20state/nested/app.db?cache=shared\n  sqlite:\n    path: ./unused/app.db\nlog:\n  filename: '%s'\n", absoluteLog)
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareRuntimeDirectories(configPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{filepath.Join(directory, "custom state", "nested"), filepath.Dir(absoluteLog)} {
+		if info, err := os.Stat(expected); err != nil || !info.IsDir() {
+			t.Fatalf("custom directory not prepared %q: %v", expected, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(directory, "unused")); !os.IsNotExist(err) {
+		t.Fatalf("ignored sqlite.path was created: %v", err)
+	}
+}
+
+func TestPrepareRuntimeDirectoriesSkipsNonFileDatabases(t *testing.T) {
+	for name, database := range map[string]string{
+		"disabled":      "enabled: false\n  type: sqlite\n  sqlite:\n    path: ./unused/app.db",
+		"mysql":         "enabled: true\n  type: mysql\n  sqlite:\n    path: ./unused/app.db",
+		"memory":        "enabled: true\n  type: sqlite\n  url: ':memory:'",
+		"memory_uri":    "enabled: true\n  type: sqlite\n  url: 'file:unused/app.db?mode=memory&cache=shared'",
+		"read_only_uri": "enabled: true\n  type: sqlite\n  url: 'file:unused/app.db?mode=ro'",
+	} {
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			configPath := filepath.Join(directory, "config.yaml")
+			if err := os.WriteFile(configPath, []byte("database:\n  "+database+"\nlog:\n  filename: ''\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := prepareRuntimeDirectories(configPath); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := os.ReadDir(directory)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("unexpected runtime directory for non-file database: %v %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestPrepareRuntimeDirectoriesReportsBlockedPath(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "blocked"), []byte("existing file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(directory, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("database:\n  enabled: true\n  type: sqlite\n  sqlite:\n    path: ./blocked/data/app.db\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := prepareRuntimeDirectories(configPath)
+	if err == nil || !strings.Contains(err.Error(), "SQLite database directory") || !strings.Contains(err.Error(), "write permissions") {
+		t.Fatalf("expected actionable directory error, got %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(directory, "blocked")); err != nil || string(data) != "existing file" {
+		t.Fatalf("existing file changed: %q %v", data, err)
+	}
+}
 
 func TestPrepareConfigPathChangesToConfigDirectory(t *testing.T) {
 	originalDirectory, err := os.Getwd()

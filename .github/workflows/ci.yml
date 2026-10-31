@@ -57,3 +57,6 @@ jobs:
       - name: Build native Windows package
         shell: pwsh
         run: .\scripts\windows\build.ps1 -Architecture amd64 -Version ci
+      - name: Verify package with Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\windows\verify-package.ps1 -ArchivePath .\dist\uart_sms_forwarder-windows-amd64.zip -Version ci

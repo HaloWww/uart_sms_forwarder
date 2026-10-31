@@ -246,6 +246,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 
 程序会把配置文件所在目录作为工作目录，因此配置中的 `./data/app.db` 和 `./logs/sms.log` 在从快捷方式或其他目录启动时也能保持一致。启动后访问 [http://localhost:8080](http://localhost:8080)。如果其他电脑需要访问，请允许 Windows 防火墙中的 TCP 8080 入站连接。
 
+程序启动时会自动创建配置中的 SQLite 文件父目录和日志目录，直接运行 exe 也不需要预先执行启动脚本。运行目录需要可写；若在映射盘或网络共享上遇到 SQLite 无法打开文件，请先在本地磁盘目录验证。Windows 脚本兼容系统自带的 Windows PowerShell 5.1。
+
 从源码构建需要 Go 1.26、Node.js 24 和 npm：
 
 ```powershell

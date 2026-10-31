@@ -84,7 +84,7 @@ jobs:
           # 为每个平台创建发布包
           for PLATFORM in "${PLATFORMS[@]}"; do
             RELEASE_DIR="uart_sms_forwarder-${PLATFORM}"
-            mkdir -p ${RELEASE_DIR}
+            mkdir -p ${RELEASE_DIR}/data ${RELEASE_DIR}/logs
 
             # 复制二进制文件和运行所需文件
             if [[ $PLATFORM == windows-* ]]; then
